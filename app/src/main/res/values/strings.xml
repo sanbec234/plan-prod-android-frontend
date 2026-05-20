@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Plan</string>
+    <!-- Replace with your public Mapbox access token -->
+    <string name="mapbox_access_token"></string>
+</resources>
