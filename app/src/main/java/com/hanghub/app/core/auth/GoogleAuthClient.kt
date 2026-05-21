@@ -4,9 +4,11 @@ package com.hanghub.app.core.auth
 
 import android.content.Context
 import android.content.Intent
+import android.util.Log
 import com.google.android.gms.auth.api.signin.GoogleSignIn
 import com.google.android.gms.auth.api.signin.GoogleSignInClient
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.google.android.gms.common.api.ApiException
 import com.hanghub.app.R
 import kotlinx.coroutines.tasks.await
 
@@ -18,6 +20,10 @@ import kotlinx.coroutines.tasks.await
  * directly); its deprecation is suppressed at the file level.
  */
 class GoogleAuthClient(private val context: Context) {
+
+    private companion object {
+        const val TAG = "GoogleAuthClient"
+    }
 
     /** The backend's OAuth *web* client ID — see strings.xml `default_web_client_id`. */
     private val webClientId: String = context.getString(R.string.default_web_client_id)
@@ -40,7 +46,11 @@ class GoogleAuthClient(private val context: Context) {
     suspend fun idTokenFromResult(data: Intent?): String? =
         try {
             GoogleSignIn.getSignedInAccountFromIntent(data).await().idToken
-        } catch (_: Exception) {
+        } catch (e: ApiException) {
+            Log.e(TAG, "Google sign-in ApiException: statusCode=${e.statusCode} message=${e.message}")
+            null
+        } catch (e: Exception) {
+            Log.e(TAG, "Google sign-in failed", e)
             null
         }
 
@@ -51,7 +61,11 @@ class GoogleAuthClient(private val context: Context) {
     suspend fun silentIdToken(): String? =
         try {
             client.silentSignIn().await()?.idToken
-        } catch (_: Exception) {
+        } catch (e: ApiException) {
+            Log.e(TAG, "Silent sign-in ApiException: statusCode=${e.statusCode}")
+            null
+        } catch (e: Exception) {
+            Log.e(TAG, "Silent sign-in failed", e)
             null
         }
 

@@ -1,11 +1,11 @@
 <resources>
     <string name="app_name">Plan</string>
     <!-- Replace with your public Mapbox access token -->
-    <string name="mapbox_access_token"></string>
+    <string name="mapbox_access_token">pk.eyJ1Ijoic2FuYmVjeCIsImEiOiJjbW8wNHliNjIwNWF5MnFyMDhuMDJ6YjRhIn0.U8lIS8ib0pOCjoQ_YV5QKw</string>
     <!--
         Google OAuth *web* client ID (the one the backend uses as its audience).
         Required for Google Sign-In to mint an id_token the backend accepts.
         Format: <number>-<hash>.apps.googleusercontent.com
     -->
-    <string name="default_web_client_id">500918616619-hpa5q5dbovlm59p40234vts9ajdrqqch.apps.googleusercontent.com</string>
+    <string name="default_web_client_id">500918616619-251lmopqmos88ue70sie9t4io7c527vo.apps.googleusercontent.com</string>
 </resources>
