@@ -16,13 +16,20 @@ import androidx.compose.ui.graphics.drawscope.*
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.*
+import android.Manifest
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.hanghub.app.ToastData
+import com.hanghub.app.core.appContainer
+import com.hanghub.app.core.viewModelFactory
 import com.hanghub.app.data.*
 import com.hanghub.app.ui.chrome.LocalAppChrome
 import com.hanghub.app.ui.maps.ScoutMapboxMap
 import com.hanghub.app.ui.maps.ScoutPlacePin
 import com.hanghub.app.ui.maps.ScoutUserPin
 import com.hanghub.app.ui.components.*
+import com.hanghub.app.ui.state.LocalAppState
 import com.hanghub.app.ui.theme.*
 import kotlin.math.*
 
@@ -38,9 +45,38 @@ fun ScoutScreen(
     showToast: (ToastData) -> Unit,
 ) {
     val c = hh
+    val appState = LocalAppState.current
+    val container = appContainer()
+    val scoutVm: ScoutViewModel = viewModel(
+        factory = viewModelFactory {
+            ScoutViewModel(
+                container.discoveryRepository,
+                container.profileRepository,
+                container.locationService,
+            )
+        }
+    )
     var metaphor by remember { mutableStateOf(ScoutMetaphor.MAP) }
     var selectedPlace by remember { mutableStateOf<HHPlace?>(null) }
     var showPlaceDetail by remember { mutableStateOf(false) }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result -> scoutVm.onPermissionResult(result.values.any { it }) }
+
+    LaunchedEffect(Unit) {
+        if (!scoutVm.hasLocationPermission) {
+            permissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION,
+                )
+            )
+        }
+    }
+    LaunchedEffect(scoutVm.error) {
+        scoutVm.error?.let { showToast(ToastData(it)) }
+    }
 
     Box(modifier = Modifier.fillMaxSize().background(c.bg)) {
         Column(modifier = Modifier.fillMaxSize()) {
@@ -51,13 +87,18 @@ fun ScoutScreen(
             Box(modifier = Modifier.weight(1f)) {
                 when (metaphor) {
                     ScoutMetaphor.MAP   -> ScoutMapView(
+                        friends = appState.friends,
+                        places = scoutVm.places,
                         onSelectPlace = { selectedPlace = it; showPlaceDetail = true },
-                        onSelectUser  = { u -> showToast(ToastData("${u.name} is ${u.status.label}", u.distance?.let { "${String.format("%.1f", it)} mi away" })) }
+                        onSelectUser  = { u -> showToast(ToastData("${u.name} is ${u.status.label}")) }
                     )
                     ScoutMetaphor.RADAR -> ScoutRadarView(
+                        friends = appState.friends,
                         onSelectUser = { u -> showToast(ToastData("${u.name} is ${u.status.label}")) }
                     )
                     ScoutMetaphor.STACK -> ScoutStackView(
+                        places = scoutVm.places,
+                        isLoading = scoutVm.isLoading,
                         onSelectPlace = { selectedPlace = it; showPlaceDetail = true }
                     )
                 }
@@ -88,7 +129,7 @@ fun ScoutScreen(
 
             // ── Discovery peek ──────────────────────────────────────────
             if (metaphor != ScoutMetaphor.STACK) {
-                DiscoveryPeek(onClick = onCreatePlan)
+                DiscoveryPeek(count = scoutVm.places.size, onClick = onCreatePlan)
             }
         }
 
@@ -167,7 +208,7 @@ private fun ScoutHeader(metaphor: ScoutMetaphor, onMetaphorChange: (ScoutMetapho
 // ── Discovery peek ────────────────────────────────────────────────────────
 
 @Composable
-private fun DiscoveryPeek(onClick: () -> Unit) {
+private fun DiscoveryPeek(count: Int, onClick: () -> Unit) {
     val c = hh
     Surface(
         onClick = onClick,
@@ -192,9 +233,13 @@ private fun DiscoveryPeek(onClick: () -> Unit) {
             ) {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     MonoLabel("Discover")
-                    Text("3 cozy spots nearby", style = HHType.display(19), color = c.ink)
+                    Text(
+                        if (count > 0) "$count spots nearby" else "Finding spots nearby…",
+                        style = HHType.display(19),
+                        color = c.ink,
+                    )
                 }
-                AvatarStack(SampleData.users.drop(1).take(3).map { it.id }, size = 30.dp)
+                Text("→", fontSize = 20.sp, color = c.inkMute)
             }
         }
     }
@@ -204,42 +249,29 @@ private fun DiscoveryPeek(onClick: () -> Unit) {
 // MARK: ScoutMapView — stylised neighbourhood map in Canvas
 // ═══════════════════════════════════════════════════════════════════════════
 
-private data class FriendSpot(val user: HHUser, val xFrac: Float, val yFrac: Float)
-private data class PlacePin(val place: HHPlace, val xFrac: Float, val yFrac: Float)
-
-private val friendSpots = run {
-    val u = SampleData.users
-    listOf(
-        FriendSpot(u[1], 0.38f, 0.34f), FriendSpot(u[2], 0.68f, 0.48f),
-        FriendSpot(u[3], 0.22f, 0.62f), FriendSpot(u[5], 0.55f, 0.72f),
-        FriendSpot(u[4], 0.80f, 0.30f), FriendSpot(u[6], 0.14f, 0.30f),
-        FriendSpot(u[7], 0.72f, 0.78f),
-    )
-}
-private val placePins = listOf(
-    PlacePin(SampleData.places[0], 0.45f, 0.46f),
-    PlacePin(SampleData.places[4], 0.30f, 0.54f),
-    PlacePin(SampleData.places[3], 0.62f, 0.62f),
+// Stylised overlay positions — the Android Scout map is a designed canvas, not
+// a geo-accurate projection, so friends/places are spread across fixed anchors.
+private val PIN_ANCHORS: List<Pair<Float, Float>> = listOf(
+    0.38f to 0.34f, 0.68f to 0.48f, 0.22f to 0.62f, 0.55f to 0.72f,
+    0.80f to 0.30f, 0.14f to 0.30f, 0.72f to 0.78f, 0.45f to 0.46f,
+    0.30f to 0.54f, 0.62f to 0.62f,
 )
 
 @Composable
-fun ScoutMapView(onSelectPlace: (HHPlace) -> Unit, onSelectUser: (HHUser) -> Unit) {
+fun ScoutMapView(
+    friends: List<HHUser>,
+    places: List<HHPlace>,
+    onSelectPlace: (HHPlace) -> Unit,
+    onSelectUser: (HHUser) -> Unit,
+) {
     ScoutMapboxMap(
-        userPins = friendSpots.map { spot ->
-            ScoutUserPin(
-                id = "user:${spot.user.id}",
-                user = spot.user,
-                xFrac = spot.xFrac,
-                yFrac = spot.yFrac,
-            )
+        userPins = friends.take(7).mapIndexed { i, user ->
+            val (x, y) = PIN_ANCHORS[i % PIN_ANCHORS.size]
+            ScoutUserPin(id = "user:${user.id}", user = user, xFrac = x, yFrac = y)
         },
-        placePins = placePins.map { pin ->
-            ScoutPlacePin(
-                id = "place:${pin.place.id}",
-                place = pin.place,
-                xFrac = pin.xFrac,
-                yFrac = pin.yFrac,
-            )
+        placePins = places.take(6).mapIndexed { i, place ->
+            val (x, y) = PIN_ANCHORS[(i + 7) % PIN_ANCHORS.size]
+            ScoutPlacePin(id = "place:${place.id}", place = place, xFrac = x, yFrac = y)
         },
         onUserTap = onSelectUser,
         onPlaceTap = onSelectPlace,
@@ -278,9 +310,9 @@ private fun PlacePill(place: HHPlace, onClick: () -> Unit) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 @Composable
-fun ScoutRadarView(onSelectUser: (HHUser) -> Unit) {
+fun ScoutRadarView(friends: List<HHUser>, onSelectUser: (HHUser) -> Unit) {
     val c = hh
-    val users = SampleData.users.drop(1).take(6)
+    val users = friends.take(6)
 
     val sweepAnim = rememberInfiniteTransition(label = "sweep")
     val sweepAngle by sweepAnim.animateFloat(
@@ -367,11 +399,24 @@ fun ScoutRadarView(onSelectUser: (HHUser) -> Unit) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 @Composable
-fun ScoutStackView(onSelectPlace: (HHPlace) -> Unit) {
+fun ScoutStackView(
+    places: List<HHPlace>,
+    isLoading: Boolean,
+    onSelectPlace: (HHPlace) -> Unit,
+) {
     val c = hh
+    if (places.isEmpty()) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text(
+                if (isLoading) "Finding places nearby…" else "No places found nearby.",
+                style = HHType.bodySm,
+                color = c.inkMute,
+            )
+        }
+        return
+    }
     var topIndex by remember { mutableIntStateOf(0) }
     var dragOffsetX by remember { mutableFloatStateOf(0f) }
-    val places = SampleData.places
 
     val animDragX by animateFloatAsState(dragOffsetX, label = "dragX")
 

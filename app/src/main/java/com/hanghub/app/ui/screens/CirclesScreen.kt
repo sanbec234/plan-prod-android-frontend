@@ -14,10 +14,18 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.*
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.hanghub.app.ToastData
+import com.hanghub.app.core.appContainer
+import com.hanghub.app.core.viewModelFactory
 import com.hanghub.app.data.*
+import com.hanghub.app.data.dto.ChatDto
+import com.hanghub.app.data.dto.FriendRequestDto
+import com.hanghub.app.data.dto.SearchUserDto
 import com.hanghub.app.ui.chrome.LocalAppChrome
 import com.hanghub.app.ui.components.*
+import com.hanghub.app.ui.state.AppStateViewModel
+import com.hanghub.app.ui.state.LocalAppState
 import com.hanghub.app.ui.theme.*
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -31,6 +39,8 @@ fun CirclesScreen(showToast: (ToastData) -> Unit) {
     val c = hh
     var activeTab by remember { mutableStateOf(CirclesTab.FRIENDS) }
     var selectedChat by remember { mutableStateOf<HHChat?>(null) }
+    var showCreateGroup by remember { mutableStateOf(false) }
+    var groupDetails by remember { mutableStateOf<ChatDto?>(null) }
 
     Column(modifier = Modifier.fillMaxSize().background(c.bg)) {
         // ── Header ─────────────────────────────────────────────────────
@@ -72,44 +82,167 @@ fun CirclesScreen(showToast: (ToastData) -> Unit) {
 
         // ── Tab content ─────────────────────────────────────────────────
         when (activeTab) {
-            CirclesTab.FRIENDS -> FriendsTab()
+            CirclesTab.FRIENDS -> FriendsTab(showToast = showToast)
             CirclesTab.CHATS   -> ChatsTab(onOpenChat = { selectedChat = it })
-            CirclesTab.GROUPS  -> GroupsTab()
+            CirclesTab.GROUPS  -> GroupsTab(
+                onOpenChat = { selectedChat = it },
+                onCreateGroup = { showCreateGroup = true },
+                onOpenDetails = { groupDetails = it },
+            )
         }
     }
 
     selectedChat?.let { chat ->
         ChatScreen(chat = chat, onDismiss = { selectedChat = null })
     }
+
+    if (showCreateGroup) {
+        CreateGroupSheet(
+            onDismiss = { showCreateGroup = false },
+            onCreated = {
+                showCreateGroup = false
+                showToast(ToastData("Group created!"))
+            },
+        )
+    }
+
+    groupDetails?.let { group ->
+        GroupDetailsSheet(
+            group = group,
+            onDismiss = { groupDetails = null },
+            onLeft = {
+                groupDetails = null
+                showToast(ToastData("Left ${group.name ?: "group"}"))
+            },
+        )
+    }
 }
 
 // ── Friends tab ───────────────────────────────────────────────────────────
 
 @Composable
-private fun FriendsTab() {
+private fun FriendsTab(showToast: (ToastData) -> Unit) {
     val c = hh
-    val freeUsers    = SampleData.users.filter { it.status == UserStatus.FREE    && it.id != "me" }
-    val notFreeUsers = SampleData.users.filter { it.status != UserStatus.FREE    && it.id != "me" }
+    val appState = LocalAppState.current
+    val container = appContainer()
+    val vm: FriendsViewModel = viewModel(
+        factory = viewModelFactory { FriendsViewModel(appState, container.friendsRepository) }
+    )
+
+    LaunchedEffect(vm.actionError) {
+        vm.actionError?.let { showToast(ToastData(it)); vm.clearError() }
+    }
+
+    val friends = appState.friends
+    val searching = vm.searchQuery.isNotBlank()
 
     LazyColumn(
         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
-        item { MonoLabel("Free now · ${freeUsers.size}"); Spacer(Modifier.height(10.dp)) }
-        items(freeUsers) { u -> FriendRow(user = u); Spacer(Modifier.height(2.dp)) }
-        item { Spacer(Modifier.height(18.dp)); MonoLabel("Busy or away"); Spacer(Modifier.height(10.dp)) }
-        items(notFreeUsers) { u -> FriendRow(user = u); Spacer(Modifier.height(2.dp)) }
+        // ── Search field ────────────────────────────────────────────────
+        item {
+            OutlinedTextField(
+                value = vm.searchQuery,
+                onValueChange = vm::onSearchQueryChange,
+                placeholder = { Text("Search people by name or @handle", style = HHType.bodySm, color = c.inkDim) },
+                singleLine = true,
+                shape = CircleShape,
+                textStyle = HHType.bodySm.copy(color = c.ink),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = c.accent, unfocusedBorderColor = c.stroke,
+                    focusedContainerColor = c.surface, unfocusedContainerColor = c.surface,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(12.dp))
+        }
+
+        if (searching) {
+            // ── Search results ──────────────────────────────────────────
+            if (vm.isSearching) {
+                item { CenteredSpinner() }
+            } else if (vm.searchResults.isEmpty()) {
+                item { Text("No people found.", style = HHType.bodySm, color = c.inkMute) }
+            } else {
+                items(vm.searchResults, key = { it.id }) { result ->
+                    SearchResultRow(
+                        result = result,
+                        alreadySent = vm.sentTo.contains(result.id),
+                        onAdd = { vm.sendRequest(result.id) },
+                    )
+                    Spacer(Modifier.height(2.dp))
+                }
+            }
+        } else {
+            // ── Incoming requests ───────────────────────────────────────
+            if (vm.requests.isNotEmpty()) {
+                item {
+                    MonoLabel("Friend requests · ${vm.requests.size}")
+                    Spacer(Modifier.height(10.dp))
+                }
+                items(vm.requests, key = { it.id }) { req ->
+                    FriendRequestRow(
+                        request = req,
+                        onAccept = { vm.accept(req.id) },
+                        onDecline = { vm.decline(req.id) },
+                    )
+                    Spacer(Modifier.height(6.dp))
+                }
+                item { Spacer(Modifier.height(14.dp)) }
+            }
+
+            // ── Friends list ────────────────────────────────────────────
+            val freeUsers = friends.filter { it.status == UserStatus.FREE }
+            val notFreeUsers = friends.filter { it.status != UserStatus.FREE }
+
+            when {
+                appState.isLoadingCircles && friends.isEmpty() -> item { CenteredSpinner() }
+                friends.isEmpty() -> item {
+                    Text(
+                        "No friends yet — search above to send your first request.",
+                        style = HHType.bodySm, color = c.inkMute,
+                    )
+                }
+                else -> {
+                    item { MonoLabel("Free now · ${freeUsers.size}"); Spacer(Modifier.height(10.dp)) }
+                    items(freeUsers, key = { it.id }) { u ->
+                        FriendRow(user = u, onRemove = { vm.removeFriend(u.id); showToast(ToastData("Removed ${u.name}")) })
+                        Spacer(Modifier.height(2.dp))
+                    }
+                    if (notFreeUsers.isNotEmpty()) {
+                        item { Spacer(Modifier.height(18.dp)); MonoLabel("Busy or away"); Spacer(Modifier.height(10.dp)) }
+                        items(notFreeUsers, key = { it.id }) { u ->
+                            FriendRow(user = u, onRemove = { vm.removeFriend(u.id); showToast(ToastData("Removed ${u.name}")) })
+                            Spacer(Modifier.height(2.dp))
+                        }
+                    }
+                }
+            }
+        }
         item { Spacer(Modifier.height(110.dp)) }
     }
 }
 
 @Composable
-private fun FriendRow(user: HHUser) {
+private fun CenteredSpinner() {
+    val c = hh
+    Box(modifier = Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+        CircularProgressIndicator(color = c.accent)
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun FriendRow(user: HHUser, onRemove: () -> Unit) {
     val c = hh
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
-        modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp)
+        modifier = Modifier
+            .fillMaxWidth()
+            .combinedClickable(onClick = {}, onLongClick = onRemove)
+            .padding(vertical = 10.dp),
     ) {
         AvatarView(user = user, size = 40.dp)
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -118,18 +251,78 @@ private fun FriendRow(user: HHUser) {
                 AuraBadge(user.aura)
             }
             Text(
-                when (user.status) {
-                    UserStatus.FREE    -> "${user.distance?.let { "${String.format("%.1f", it)}mi away · " } ?: ""}free"
-                    UserStatus.BUSY    -> "busy now"
-                    UserStatus.OFFLINE -> "last seen 2h ago"
-                },
+                user.username?.let { "@$it" } ?: user.status.label,
                 style = HHType.caption,
                 color = c.inkMute,
             )
         }
-        if (user.status == UserStatus.FREE) {
-            Surface(shape = CircleShape, color = c.accentSoft) {
-                Text("Invite", style = HHType.caption, fontWeight = FontWeight.Bold, color = c.accentInk, modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp))
+    }
+}
+
+@Composable
+private fun FriendRequestRow(
+    request: FriendRequestDto,
+    onAccept: () -> Unit,
+    onDecline: () -> Unit,
+) {
+    val c = hh
+    Surface(
+        shape = RoundedCornerShape(HHRadius.lg),
+        color = c.surface,
+        border = BorderStroke(1.dp, c.stroke),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier.size(40.dp).clip(CircleShape).background(c.bgElev),
+            ) { Text(request.fromAvatar.ifBlank { "👤" }, fontSize = 20.sp) }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(request.fromName, style = HHType.bodyMd, fontWeight = FontWeight.SemiBold, color = c.ink)
+                Text("wants to connect", style = HHType.caption, color = c.inkMute)
+            }
+            Surface(onClick = onDecline, shape = CircleShape, color = c.bgElev) {
+                Text("✕", fontSize = 14.sp, color = c.inkMute, modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+            }
+            Surface(onClick = onAccept, shape = CircleShape, color = c.accent) {
+                Text("Accept", style = HHType.caption, fontWeight = FontWeight.Bold, color = c.onAccent, modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchResultRow(
+    result: SearchUserDto,
+    alreadySent: Boolean,
+    onAdd: () -> Unit,
+) {
+    val c = hh
+    val status = result.friendshipStatus
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier.size(40.dp).clip(CircleShape).background(c.bgElev),
+        ) { Text(result.avatar.ifBlank { "👤" }, fontSize = 20.sp) }
+        Column(modifier = Modifier.weight(1f)) {
+            Text(result.name, style = HHType.bodyMd, fontWeight = FontWeight.SemiBold, color = c.ink)
+            Text("@${result.username}", style = HHType.caption, color = c.inkMute)
+        }
+        when {
+            status == "accepted" ->
+                Text("Friends", style = HHType.caption, color = c.inkMute)
+            status == "pending" || alreadySent ->
+                Text("Requested", style = HHType.caption, color = c.accentInk)
+            else -> Surface(onClick = onAdd, shape = CircleShape, color = c.accentSoft) {
+                Text("Add", style = HHType.caption, fontWeight = FontWeight.Bold, color = c.accentInk, modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp))
             }
         }
     }
@@ -140,12 +333,31 @@ private fun FriendRow(user: HHUser) {
 @Composable
 private fun ChatsTab(onOpenChat: (HHChat) -> Unit) {
     val c = hh
+    val appState = LocalAppState.current
+    val chats = appState.chats
     LazyColumn(
         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        items(SampleData.chats) { chat ->
-            val user = SampleData.user(chat.userID) ?: return@items
+        if (appState.isLoadingCircles && chats.isEmpty()) {
+            item { CenteredSpinner() }
+        }
+        if (!appState.isLoadingCircles && chats.isEmpty()) {
+            item {
+                Text(
+                    "No conversations yet — create a plan with a friend to start one.",
+                    style = HHType.bodySm, color = c.inkMute,
+                )
+            }
+        }
+        items(chats, key = { it.id }) { chat ->
+            val user = HHUser(
+                id = chat.userID,
+                name = chat.partnerName.ifBlank { "Chat" },
+                avatar = chat.partnerAvatar,
+                status = UserStatus.OFFLINE,
+                aura = 0,
+            )
             Surface(
                 onClick = { onOpenChat(chat) },
                 shape = RoundedCornerShape(HHRadius.lg),
@@ -190,31 +402,63 @@ private fun ChatsTab(onOpenChat: (HHChat) -> Unit) {
 
 // ── Groups tab ────────────────────────────────────────────────────────────
 
-private val groups = listOf(
-    Triple("The Brunch Club", "🥞", 6 to true),
-    Triple("Hiking Crew",     "🗻", 8 to false),
-    Triple("Movie Buddies",   "🎬", 4 to false),
-)
-
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun GroupsTab() {
+private fun GroupsTab(
+    onOpenChat: (HHChat) -> Unit,
+    onCreateGroup: () -> Unit,
+    onOpenDetails: (ChatDto) -> Unit,
+) {
     val c = hh
+    val appState = LocalAppState.current
+    val groups = appState.groups
     LazyColumn(
         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        items(groups) { (name, emoji, meta) ->
-            HHCard {
+        item {
+            Surface(
+                onClick = onCreateGroup,
+                shape = RoundedCornerShape(HHRadius.lg),
+                color = c.accentSoft,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Row(
+                    modifier = Modifier.padding(14.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("+", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = c.accentInk)
+                    Text("New group", style = HHType.bodyMd, fontWeight = FontWeight.Bold, color = c.accentInk)
+                }
+            }
+        }
+
+        if (appState.isLoadingCircles && groups.isEmpty()) {
+            item { CenteredSpinner() }
+        }
+        if (!appState.isLoadingCircles && groups.isEmpty()) {
+            item {
+                Text("No groups yet — create one to plan together.", style = HHType.bodySm, color = c.inkMute)
+            }
+        }
+
+        items(groups, key = { it.id }) { group ->
+            HHCard(
+                modifier = Modifier.combinedClickable(
+                    onClick = { onOpenChat(group.toHHChat(appState.currentUserId)) },
+                    onLongClick = { onOpenDetails(group) },
+                )
+            ) {
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Box(
                         contentAlignment = Alignment.Center,
-                        modifier = Modifier.size(44.dp).clip(RoundedCornerShape(HHRadius.md)).background(c.bgElev)
-                    ) { Text(emoji, fontSize = 22.sp) }
+                        modifier = Modifier.size(44.dp).clip(RoundedCornerShape(HHRadius.md)).background(c.bgElev),
+                    ) { Text(group.emoji ?: "👥", fontSize = 22.sp) }
                     Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text(name, style = HHType.bodyMd, fontWeight = FontWeight.SemiBold, color = c.ink)
-                        Text("${meta.first} members", style = HHType.caption, color = c.inkMute)
+                        Text(group.name ?: "Group", style = HHType.bodyMd, fontWeight = FontWeight.SemiBold, color = c.ink)
+                        Text("${group.members.size} members", style = HHType.caption, color = c.inkMute)
                     }
-                    if (meta.second) LiveDot(color = c.accent, label = "planning now")
                 }
             }
         }
@@ -231,19 +475,36 @@ private fun GroupsTab() {
 fun ChatScreen(chat: HHChat, onDismiss: () -> Unit) {
     val c = hh
     val chrome = LocalAppChrome.current
+    val appState = LocalAppState.current
+    val container = appContainer()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val user = SampleData.user(chat.userID) ?: return
-    var planCardState by remember { mutableStateOf(PlanCardState.VOTING) }
-    val states = PlanCardState.entries
+    val vm: ChatViewModel = viewModel(
+        key = "chat-${chat.id}",
+        factory = viewModelFactory {
+            ChatViewModel(
+                chatId = chat.id,
+                currentUserId = appState.currentUserId,
+                chatRepository = container.chatRepository,
+                webSocketManager = container.webSocketManager,
+            )
+        },
+    )
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val partner = HHUser(
+        id = chat.userID,
+        name = chat.partnerName.ifBlank { "Chat" },
+        avatar = chat.partnerAvatar,
+        status = UserStatus.OFFLINE,
+        aura = 0,
+    )
 
-    // Hide the floating tab bar while this sheet is shown
     DisposableEffect(Unit) {
         val pop = chrome.pushTabBarHidden()
         onDispose { pop() }
     }
-
-    LaunchedEffect(Unit) {
-        sheetState.expand()
+    LaunchedEffect(Unit) { sheetState.expand() }
+    LaunchedEffect(vm.messages.size) {
+        if (vm.messages.isNotEmpty()) listState.animateScrollToItem(vm.messages.size - 1)
     }
 
     ModalBottomSheet(
@@ -255,82 +516,57 @@ fun ChatScreen(chat: HHChat, onDismiss: () -> Unit) {
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             // ── Chat header ─────────────────────────────────────────────
-            Surface(color = c.bg, border = BorderStroke(width = 0.dp, color = Color.Transparent)) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .statusBarsPadding()
-                        .padding(horizontal = 18.dp, vertical = 14.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Surface(onClick = onDismiss, shape = CircleShape, color = Color.Transparent) {
-                        Text("←", fontSize = 20.sp, color = c.ink, modifier = Modifier.padding(4.dp))
-                    }
-                    AvatarView(user = user, size = 36.dp)
-                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text(user.name, style = HHType.bodyMd, fontWeight = FontWeight.Bold, color = c.ink)
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
-                            TypingIndicator()
-                            Text("typing…", style = HHType.caption, color = c.accent)
+            Surface(color = c.bg) {
+                Column {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .statusBarsPadding()
+                            .padding(horizontal = 18.dp, vertical = 14.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Surface(onClick = onDismiss, shape = CircleShape, color = Color.Transparent) {
+                            Text("←", fontSize = 20.sp, color = c.ink, modifier = Modifier.padding(4.dp))
+                        }
+                        AvatarView(user = partner, size = 36.dp)
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(partner.name, style = HHType.bodyMd, fontWeight = FontWeight.Bold, color = c.ink)
+                            if (vm.partnerTyping) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    TypingIndicator()
+                                    Text("typing…", style = HHType.caption, color = c.accent)
+                                }
+                            }
                         }
                     }
-                    Surface(shape = CircleShape, color = c.surface, border = BorderStroke(1.dp, c.stroke)) {
-                        Text("+ Plan", style = HHType.caption, fontWeight = FontWeight.Bold, color = c.ink, modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp))
-                    }
+                    HorizontalDivider(color = c.stroke)
                 }
-                HorizontalDivider(color = c.stroke)
             }
 
             // ── Messages ─────────────────────────────────────────────────
-            LazyColumn(
-                modifier = Modifier.weight(1f),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                item {
-                    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                        Text("TODAY", style = HHType.monoXs, color = c.inkDim, modifier = Modifier.padding(vertical = 10.dp))
-                    }
-                }
-
-                items(SampleData.chatThread.take(3)) { msg -> BubbleView(message = msg) }
-
-                item {
-                    // Plan message card
-                    PlanMessageCard(state = planCardState, onCycleState = {
-                        planCardState = states[(states.indexOf(planCardState) + 1) % states.size]
-                    })
-                    // cycle button
-                    Box(modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 6.dp), contentAlignment = Alignment.Center) {
-                        Surface(
-                            onClick = { planCardState = states[(states.indexOf(planCardState) + 1) % states.size] },
-                            shape = CircleShape,
-                            color = c.bgElev,
-                            border = BorderStroke(1.dp, c.stroke),
-                        ) {
-                            Text(
-                                "tap to cycle · ${planCardState.name.lowercase()}",
-                                style = HHType.monoXs,
-                                color = c.inkMute,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                            )
+            Box(modifier = Modifier.weight(1f)) {
+                when {
+                    vm.isLoading -> CenteredSpinner()
+                    vm.error != null && vm.messages.isEmpty() ->
+                        Box(Modifier.fillMaxSize(), Alignment.Center) {
+                            Text(vm.error ?: "", style = HHType.bodySm, color = c.inkMute)
+                        }
+                    vm.messages.isEmpty() ->
+                        Box(Modifier.fillMaxSize(), Alignment.Center) {
+                            Text("Say hi 👋", style = HHType.bodySm, color = c.inkMute)
+                        }
+                    else -> LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        items(vm.messages, key = { it.id.ifBlank { it.hashCode().toString() } }) { msg ->
+                            BubbleView(message = msg)
                         }
                     }
                 }
-
-                items(SampleData.chatThread.drop(3)) { msg -> BubbleView(message = msg) }
-
-                item {
-                    // typing bubble
-                    Row {
-                        Surface(shape = RoundedCornerShape(20.dp), color = c.surface, border = BorderStroke(1.dp, c.stroke)) {
-                            Box(modifier = Modifier.padding(horizontal = 13.dp, vertical = 12.dp)) { TypingIndicator() }
-                        }
-                        Spacer(Modifier.weight(1f))
-                    }
-                }
-                item { Spacer(Modifier.height(8.dp)) }
             }
 
             // ── Composer ──────────────────────────────────────────────────
@@ -342,18 +578,25 @@ fun ChatScreen(chat: HHChat, onDismiss: () -> Unit) {
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Surface(
+                OutlinedTextField(
+                    value = vm.draft,
+                    onValueChange = vm::onDraftChange,
+                    placeholder = {
+                        Text("Message ${partner.name.split(" ").first()}…", style = HHType.bodySm, color = c.inkDim)
+                    },
+                    singleLine = true,
                     shape = CircleShape,
-                    color = c.bgElev,
-                    border = BorderStroke(1.dp, c.stroke),
-                    modifier = Modifier.weight(1f).height(48.dp),
-                ) {
-                    Box(modifier = Modifier.padding(horizontal = 16.dp), contentAlignment = Alignment.CenterStart) {
-                        Text("Message ${user.name.split(" ").first()}…", style = HHType.bodySm, color = c.inkDim)
+                    textStyle = HHType.bodySm.copy(color = c.ink),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = c.accent, unfocusedBorderColor = c.stroke,
+                        focusedContainerColor = c.bgElev, unfocusedContainerColor = c.bgElev,
+                    ),
+                    modifier = Modifier.weight(1f),
+                )
+                Surface(onClick = { vm.send() }, shape = CircleShape, color = c.accent, modifier = Modifier.size(48.dp)) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text("→", fontSize = 16.sp, color = c.onAccent, fontWeight = FontWeight.Bold)
                     }
-                }
-                Surface(shape = CircleShape, color = c.accent, modifier = Modifier.size(42.dp)) {
-                    Box(contentAlignment = Alignment.Center) { Text("→", fontSize = 16.sp, color = c.onAccent, fontWeight = FontWeight.Bold) }
                 }
             }
         }
@@ -381,193 +624,3 @@ private fun BubbleView(message: ChatMessage) {
         if (!isMine) Spacer(Modifier.weight(1f).widthIn(min = 60.dp))
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// MARK: PlanMessageCard — 4 states in the chat thread
-// ═══════════════════════════════════════════════════════════════════════════
-
-enum class PlanCardState { SUGGESTION, VOTING, RSVP, FINALIZED }
-
-@Composable
-fun PlanMessageCard(state: PlanCardState, onCycleState: () -> Unit) {
-    val c = hh
-    val dark = c.isDark
-
-    val headerBg: Color
-    val headerInk: Color
-    val headerLabel: String
-    when (state) {
-        PlanCardState.SUGGESTION -> { headerBg = Color(0xFFFBE8CB); headerInk = Color(0xFF8A5510); headerLabel = "New hangout" }
-        PlanCardState.VOTING     -> { headerBg = c.accentSoft;       headerInk = c.accentInk;       headerLabel = "Voting · 2h 15m left" }
-        PlanCardState.RSVP       -> { headerBg = c.accentSoft;       headerInk = c.accentInk;       headerLabel = "Locked in · RSVP" }
-        PlanCardState.FINALIZED  -> { headerBg = Color(0xFFD6EEDF);  headerInk = Color(0xFF1C5A3A); headerLabel = "Confirmed · Today" }
-    }
-
-    Surface(
-        shape = RoundedCornerShape(HHRadius.lg),
-        color = c.surface,
-        border = BorderStroke(1.dp, c.stroke),
-        shadowElevation = 4.dp,
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Column {
-            // Header
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(topStart = HHRadius.lg, topEnd = HHRadius.lg))
-                    .background(headerBg)
-                    .padding(horizontal = 14.dp, vertical = 12.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("⚾", fontSize = 18.sp)
-                    Column {
-                        Text(headerLabel.uppercase(), style = HHType.monoXs, color = headerInk.copy(alpha = 0.75f))
-                        Text("Yankees Game", style = HHType.display(17), color = headerInk)
-                    }
-                }
-                if (state == PlanCardState.VOTING) {
-                    Surface(shape = CircleShape, color = c.surface) {
-                        Text("2:15", style = HHType.mono, fontWeight = FontWeight.Bold, color = headerInk, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
-                    }
-                }
-                if (state == PlanCardState.FINALIZED) {
-                    Text("✓", fontSize = 20.sp, color = c.statusFree)
-                }
-            }
-
-            // Body
-            when (state) {
-                PlanCardState.SUGGESTION -> SuggestionBody(headerInk, onCycleState)
-                PlanCardState.VOTING     -> VotingBody(onCycleState)
-                PlanCardState.RSVP       -> RsvpBody(onCycleState)
-                PlanCardState.FINALIZED  -> FinalizedBody()
-            }
-        }
-    }
-}
-
-@Composable
-private fun SuggestionBody(accentInk: Color, onJoin: () -> Unit) {
-    val c = hh
-    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        HHCard(padding = PaddingValues(10.dp)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                Box(contentAlignment = Alignment.Center, modifier = Modifier.size(40.dp).clip(RoundedCornerShape(HHRadius.sm)).background(c.bgElev)) { Text("🏟️", fontSize = 22.sp) }
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("Yankee Stadium", style = HHType.bodySm, fontWeight = FontWeight.Bold, color = c.ink)
-                    Text("★ 4.5 · $$$$ · 2.1 mi", style = HHType.caption, color = c.inkMute)
-                }
-            }
-        }
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-            Text("Voting opens 2:00 PM", style = HHType.caption, color = c.inkMute)
-            Surface(onClick = onJoin, shape = CircleShape, color = accentInk) {
-                Text("Join", style = HHType.caption, fontWeight = FontWeight.Bold, color = Color(0xFFFBE8CB), modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp))
-            }
-        }
-    }
-}
-
-@Composable
-private fun VotingBody(onVote: () -> Unit) {
-    val c = hh
-    val options = listOf(Triple("🏟️","Yankee Stadium", 70), Triple("🍕","Lombardi's Pizza",30), Triple("🍔","Shake Shack",0))
-    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        options.forEachIndexed { i, (emoji, name, pct) ->
-            val animPct by animateFloatAsState(pct / 100f, spring<Float>(dampingRatio = 0.72f).delay(i * 80), label = "pct$i")
-            Box(
-                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(HHRadius.md)).background(c.bgElev).border(1.dp, c.stroke, RoundedCornerShape(HHRadius.md))
-            ) {
-                Box(modifier = Modifier.fillMaxHeight().fillMaxWidth(animPct).background(c.accentSoft.copy(alpha = 0.55f)))
-                Row(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(emoji, fontSize = 16.sp)
-                    Text(name, style = HHType.bodySm, fontWeight = FontWeight.SemiBold, color = c.ink, modifier = Modifier.weight(1f))
-                    Text("$pct%", style = HHType.mono, fontWeight = FontWeight.Bold, color = c.ink)
-                }
-            }
-        }
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            LiveDot(color = c.accent, label = "4 / 4 VOTING")
-            Surface(onClick = onVote, shape = CircleShape, color = c.accent) {
-                Text("Vote", style = HHType.caption, fontWeight = FontWeight.Bold, color = c.onAccent, modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp))
-            }
-        }
-    }
-}
-
-@Composable
-private fun RsvpBody(onRsvp: () -> Unit) {
-    val c = hh
-    var choice by remember { mutableStateOf<String?>(null) }
-    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        HHCard(padding = PaddingValues(10.dp)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                Box(contentAlignment = Alignment.Center, modifier = Modifier.size(48.dp).clip(RoundedCornerShape(HHRadius.sm)).background(c.bgElev)) { Text("🏟️", fontSize = 26.sp) }
-                Column { Text("Yankee Stadium", style = HHType.bodySm, fontWeight = FontWeight.Bold, color = c.ink); Text("Sat Apr 20 · 6:00 PM", style = HHType.caption, color = c.inkMute) }
-            }
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text("✓ 3 confirmed", style = HHType.caption, fontWeight = FontWeight.Bold, color = c.statusFree)
-            Text("·", style = HHType.caption, color = c.inkMute)
-            Text("? 1 maybe", style = HHType.caption, fontWeight = FontWeight.Bold, color = c.statusBusy)
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf(Triple("yes","I'm in",c.statusFree), Triple("maybe","Maybe",c.statusBusy), Triple("no","Can't",Color(0xFFE2442F))).forEach { (k, l, col) ->
-                Surface(
-                    onClick = { choice = k; onRsvp() },
-                    shape = CircleShape,
-                    color = if (choice == k) col else c.surface,
-                    border = BorderStroke(1.5.dp, if (choice == k) Color.Transparent else c.stroke),
-                    modifier = if (k == "yes") Modifier.weight(2f).height(36.dp) else Modifier.width(70.dp).height(36.dp),
-                ) { Box(contentAlignment = Alignment.Center) { Text(l, style = HHType.caption, fontWeight = FontWeight.Bold, color = if (choice == k) Color.White else c.ink) } }
-            }
-        }
-    }
-}
-
-@Composable
-private fun FinalizedBody() {
-    val c = hh
-    val participants = SampleData.users.take(4)
-    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(HHRadius.md)).background(Color(0xFFD6EEDF)).padding(10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("🏟️", fontSize = 28.sp)
-            Column { Text("Yankee Stadium", style = HHType.bodySm, fontWeight = FontWeight.Bold, color = Color(0xFF1C5A3A)); Text("Bronx, NY · Sat Apr 20 · 6:00 PM", style = HHType.caption, color = Color(0xFF1C5A3A).copy(alpha = 0.75f)) }
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-            AvatarStack(participants.map { it.id }, size = 28.dp)
-            Text("${participants.size} going", style = HHType.caption, fontWeight = FontWeight.SemiBold, color = c.ink)
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf("Cost split" to "You owe $0", "Ticket" to "#YKEES2847").forEach { (label, value) ->
-                Column(modifier = Modifier.weight(1f).clip(RoundedCornerShape(HHRadius.sm)).background(c.bgElev).border(1.dp, c.stroke, RoundedCornerShape(HHRadius.sm)).padding(horizontal = 10.dp, vertical = 8.dp)) {
-                    MonoLabel(label); Spacer(Modifier.height(2.dp)); Text(value, style = HHType.bodySm, fontWeight = FontWeight.Bold, color = c.ink)
-                }
-            }
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Surface(shape = CircleShape, color = c.ink, modifier = Modifier.weight(1f).height(38.dp)) { Box(contentAlignment = Alignment.Center) { Text("🗺 Open in Maps", style = HHType.caption, fontWeight = FontWeight.Bold, color = c.onAccent) } }
-            Surface(shape = CircleShape, color = c.surface, border = BorderStroke(1.dp, c.stroke), modifier = Modifier.weight(1f).height(38.dp)) { Box(contentAlignment = Alignment.Center) { Text("Details", style = HHType.caption, fontWeight = FontWeight.Bold, color = c.ink) } }
-        }
-    }
-}
-
-// AnimationSpec delay extension
-private fun <T> AnimationSpec<T>.delay(millis: Int): AnimationSpec<T> =
-    if (millis == 0) this else object : AnimationSpec<T> by this {
-        override fun <V : AnimationVector> vectorize(converter: TwoWayConverter<T, V>) =
-            this@delay.vectorize(converter).run {
-                object : VectorizedAnimationSpec<V> by this {
-                    override val isInfinite get() = this@run.isInfinite
-                    override fun getDurationNanos(initialValue: V, targetValue: V, initialVelocity: V): Long =
-                        this@run.getDurationNanos(initialValue, targetValue, initialVelocity) + millis * 1_000_000L
-                    override fun getValueFromNanos(playTimeNanos: Long, initialValue: V, targetValue: V, initialVelocity: V) =
-                        this@run.getValueFromNanos((playTimeNanos - millis * 1_000_000L).coerceAtLeast(0L), initialValue, targetValue, initialVelocity)
-                    override fun getVelocityFromNanos(playTimeNanos: Long, initialValue: V, targetValue: V, initialVelocity: V) =
-                        this@run.getVelocityFromNanos((playTimeNanos - millis * 1_000_000L).coerceAtLeast(0L), initialValue, targetValue, initialVelocity)
-                }
-            }
-    }

@@ -10,11 +10,13 @@ import com.hanghub.app.ui.theme.UserStatus
 data class HHUser(
     val id: String,
     val name: String,
-    val avatar: String,       // emoji
+    val avatar: String,           // emoji
     val status: UserStatus,
     val aura: Int,
     val streak: Int = 0,
     val distance: Double? = null,
+    val avatarId: String? = null, // "1"–"116" image asset, null = use emoji
+    val username: String? = null, // @handle, null until backend supplies it
 )
 
 data class HHPlace(
@@ -32,6 +34,9 @@ data class HHPlace(
 )
 
 enum class PlanState { VOTING, LOCKED }
+
+/** Five-state plan lifecycle, derived from backend state + deadlines + RSVPs. */
+enum class PlanStage { SUGGESTION, VOTING, DECIDING, RSVP, FINALIZED }
 
 data class PlanCost(
     val total: Int,
@@ -53,7 +58,42 @@ data class HHPlan(
     val options: List<HHPlace> = emptyList(),
     val votes: Map<String, List<String>> = emptyMap(),
     val cost: PlanCost? = null,
-)
+    // ── Backend-derived fields (null for SampleData / demo plans) ────────────
+    val chatId: String = "",
+    val rawBackendState: String? = null,   // spot_drop | pulse_vote | locked_in
+    val voteUntil: Long? = null,           // epoch millis
+    val rsvpUntil: Long? = null,           // epoch millis
+    val hostId: String? = null,            // "me" when current user created it
+    val isTicketed: Boolean = false,
+) {
+    /** Derive the lifecycle stage — mirrors iOS `HHPlan.cardState`. */
+    val stage: PlanStage
+        get() {
+            val now = System.currentTimeMillis()
+            val votingClosed = voteUntil?.let { it <= now } ?: false
+            val rsvpClosed = rsvpUntil?.let { it <= now } ?: false
+            val answered = rsvp.values.count { it == "yes" || it == "no" || it == "maybe" }
+            val everyoneAnswered = answered >= maxOf(1, participantIDs.size)
+            return when (rawBackendState) {
+                "spot_drop" -> PlanStage.SUGGESTION
+                "pulse_vote" -> if (votingClosed) PlanStage.DECIDING else PlanStage.VOTING
+                "locked_in" -> when {
+                    place == null -> PlanStage.DECIDING
+                    rsvpClosed || everyoneAnswered -> PlanStage.FINALIZED
+                    else -> PlanStage.RSVP
+                }
+                else -> when {
+                    options.isEmpty() -> PlanStage.SUGGESTION
+                    state == PlanState.LOCKED -> when {
+                        place == null -> PlanStage.DECIDING
+                        rsvpClosed || everyoneAnswered -> PlanStage.FINALIZED
+                        else -> PlanStage.RSVP
+                    }
+                    else -> if (votingClosed) PlanStage.DECIDING else PlanStage.VOTING
+                }
+            }
+        }
+}
 
 data class HHChat(
     val id: String,
@@ -62,12 +102,17 @@ data class HHChat(
     val time: String,
     val unread: Int,
     val isTyping: Boolean = false,
+    val partnerName: String = "",
+    val partnerAvatar: String = "👤",
 )
 
 data class ChatMessage(
     val from: String,
     val text: String,
     val time: String,
+    val id: String = "",
+    val senderName: String = "",
+    val pending: Boolean = false,
 )
 
 // ═══════════════════════════════════════════════════════════════════════════

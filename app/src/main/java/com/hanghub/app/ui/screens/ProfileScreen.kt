@@ -42,7 +42,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.hanghub.app.data.HHUser
 import com.hanghub.app.data.SampleData
+import com.hanghub.app.data.toHHUser
+import com.hanghub.app.ui.state.LocalAppState
 import com.hanghub.app.ui.components.HHCard
 import com.hanghub.app.ui.components.VibeChip
 import com.hanghub.app.ui.theme.HHMotion
@@ -60,7 +63,10 @@ import com.hanghub.app.ui.theme.hh
 @OptIn(ExperimentalLayoutApi::class)
 fun ProfileScreen() {
     val c = hh
-    val me = SampleData.users[0]
+    val appState = LocalAppState.current
+    val me: HHUser = appState.currentUser?.toHHUser()
+        ?: HHUser(id = "me", name = "You", avatar = "🦊", status = UserStatus.FREE, aura = 0)
+    var showEdit by remember { mutableStateOf(false) }
     var selectedStatus by remember { mutableStateOf(UserStatus.FREE) }
     var discoveryRadius by remember { mutableFloatStateOf(2f) }
     var activeVibes by remember { mutableStateOf(setOf(HangVibe.COZY, HangVibe.CHILL, HangVibe.ADVENTUROUS, HangVibe.CULTURAL)) }
@@ -108,12 +114,12 @@ fun ProfileScreen() {
                         }
                         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text(me.name, style = HHType.display(26), color = c.accentInk)
-                            Text("@you · free now", style = HHType.bodySm, color = c.accentInk.copy(alpha = 0.75f))
+                            Text("@${me.username ?: "you"} · free now", style = HHType.bodySm, color = c.accentInk.copy(alpha = 0.75f))
                         }
                     }
                     // stat tiles
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        listOf("AURA" to "✦ ${me.aura}", "STREAK" to "🔥 ${me.streak}", "HANGS" to "47").forEach { (label, value) ->
+                        listOf("AURA" to "✦ ${me.aura}", "STREAK" to "🔥 ${me.streak}", "HANGS" to "${appState.plans.size}").forEach { (label, value) ->
                             Column(
                                 modifier = Modifier.weight(1f).clip(RoundedCornerShape(HHRadius.md)).background(c.surface).padding(horizontal = 12.dp, vertical = 10.dp),
                                 verticalArrangement = Arrangement.spacedBy(4.dp)
@@ -270,12 +276,22 @@ fun ProfileScreen() {
         // ── Settings list ──────────────────────────────────────────────
         item {
             val rows = listOf(
-                Triple("Appearance",    "Auto",         false),
-                Triple("Privacy",       "Friends only", false),
-                Triple("History",       "47 hangs",     false),
-                Triple("Tickets",       "2 upcoming",   false),
-                Triple("Help & feedback","",            false),
-                Triple("Sign out",      "",             true),
+                SettingsRow("Edit profile", "") { showEdit = true },
+                SettingsRow(
+                    "Appearance",
+                    appState.themeMode.replaceFirstChar { it.uppercase() },
+                ) {
+                    appState.applyThemeMode(
+                        when (appState.themeMode) {
+                            "system" -> "light"
+                            "light" -> "dark"
+                            else -> "system"
+                        }
+                    )
+                },
+                SettingsRow("History", "${appState.plans.size} hangs") {},
+                SettingsRow("Help & feedback", "") {},
+                SettingsRow("Sign out", "", danger = true) { appState.signOut() },
             )
             Surface(
                 shape = RoundedCornerShape(HHRadius.lg),
@@ -284,16 +300,16 @@ fun ProfileScreen() {
                 modifier = Modifier.padding(horizontal = 18.dp).padding(top = 18.dp).fillMaxWidth(),
             ) {
                 Column {
-                    rows.forEachIndexed { i, (label, value, danger) ->
+                    rows.forEachIndexed { i, row ->
                         Row(
-                            modifier = Modifier.fillMaxWidth().clickable {}.padding(horizontal = 16.dp, vertical = 14.dp),
+                            modifier = Modifier.fillMaxWidth().clickable { row.onClick() }.padding(horizontal = 16.dp, vertical = 14.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Text(label, style = HHType.bodyMd, fontWeight = FontWeight.Medium, color = if (danger) Color(0xFFE2442F) else c.ink)
+                            Text(row.label, style = HHType.bodyMd, fontWeight = FontWeight.Medium, color = if (row.danger) Color(0xFFE2442F) else c.ink)
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                                if (value.isNotEmpty()) Text(value, style = HHType.caption, color = c.inkMute)
-                                if (!danger) Text("›", fontSize = 18.sp, color = c.inkDim)
+                                if (row.value.isNotEmpty()) Text(row.value, style = HHType.caption, color = c.inkMute)
+                                if (!row.danger) Text("›", fontSize = 18.sp, color = c.inkDim)
                             }
                         }
                         if (i < rows.size - 1) HorizontalDivider(modifier = Modifier.padding(start = 16.dp), color = c.stroke)
@@ -302,7 +318,22 @@ fun ProfileScreen() {
             }
         }
     }
+
+    if (showEdit) {
+        ProfileEditSheet(
+            currentName = me.name,
+            currentHandle = me.username ?: "",
+            onDismiss = { showEdit = false },
+        )
+    }
 }
+
+private data class SettingsRow(
+    val label: String,
+    val value: String,
+    val danger: Boolean = false,
+    val onClick: () -> Unit,
+)
 
 // Overloaded MonoLabel with modifier
 @Composable

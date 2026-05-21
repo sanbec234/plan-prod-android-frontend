@@ -64,7 +64,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.hanghub.app.core.appContainer
+import com.hanghub.app.core.viewModelFactory
+import com.hanghub.app.data.HHUser
 import com.hanghub.app.data.SampleData
+import com.hanghub.app.data.dto.ChatDto
+import com.hanghub.app.ui.state.LocalAppState
 import com.hanghub.app.ui.components.AvatarView
 import com.hanghub.app.ui.components.HHButtonStyle
 import com.hanghub.app.ui.components.HHCard
@@ -100,10 +106,42 @@ enum class DeadlinePreset(val label: String, val sub: String) {
     NOON(      "Tomorrow at noon", "plan ahead"),
 }
 
+/** Resolve a preset to an absolute "voting closes" epoch-millis timestamp. */
+private fun DeadlinePreset.voteUntilMillis(): Long {
+    val now = System.currentTimeMillis()
+    return when (this) {
+        DeadlinePreset.THIRTY_MIN -> now + 30 * 60_000L
+        DeadlinePreset.ONE_HOUR -> now + 60 * 60_000L
+        DeadlinePreset.TWO_HOUR -> now + 120 * 60_000L
+        DeadlinePreset.NINE_PM -> {
+            val cal = java.util.Calendar.getInstance().apply {
+                set(java.util.Calendar.HOUR_OF_DAY, 21)
+                set(java.util.Calendar.MINUTE, 0)
+                set(java.util.Calendar.SECOND, 0)
+            }
+            if (cal.timeInMillis <= now) cal.add(java.util.Calendar.DAY_OF_YEAR, 1)
+            cal.timeInMillis
+        }
+        DeadlinePreset.NOON -> java.util.Calendar.getInstance().apply {
+            add(java.util.Calendar.DAY_OF_YEAR, 1)
+            set(java.util.Calendar.HOUR_OF_DAY, 12)
+            set(java.util.Calendar.MINUTE, 0)
+            set(java.util.Calendar.SECOND, 0)
+        }.timeInMillis
+    }
+}
+
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
 fun CreatePlanFlow(onDismiss: () -> Unit, onCreated: () -> Unit) {
     val c = hh
+    val appState = LocalAppState.current
+    val container = appContainer()
+    val plansVm: PlansViewModel = viewModel(
+        factory = viewModelFactory {
+            PlansViewModel(appState, container.planRepository, container.chatRepository)
+        }
+    )
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var step by remember { mutableIntStateOf(0) }
     var title by remember { mutableStateOf("Cozy coffee") }
@@ -172,7 +210,7 @@ fun CreatePlanFlow(onDismiss: () -> Unit, onCreated: () -> Unit) {
                                 ) { currentStep ->
                                     when (currentStep) {
                                         0 -> Stage0Title(title, desc, onTitleChange = { title = it }, onDescChange = { desc = it })
-                                        1 -> Stage1Companion(companion, onSelect = { companion = it })
+                                        1 -> Stage1Companion(companion, appState.friends, appState.groups, onSelect = { companion = it })
                                         2 -> Stage2Vibe(vibe, onSelect = { vibe = it })
                                         3 -> Stage3Places(vibe, selectedPlaceIDs, loadingPlaces, onToggle = { id ->
                                             selectedPlaceIDs = if (selectedPlaceIDs.contains(id)) selectedPlaceIDs - id
@@ -193,12 +231,32 @@ fun CreatePlanFlow(onDismiss: () -> Unit, onCreated: () -> Unit) {
                         Column {
                             HorizontalDivider(color = c.stroke)
                             HHButton(
-                                label = if (step == 5) "✓ Create plan" else "Continue →",
+                                label = when {
+                                    plansVm.isCreating -> "Creating…"
+                                    step == 5 -> "✓ Create plan"
+                                    else -> "Continue →"
+                                },
                                 style = HHButtonStyle.PRIMARY,
                                 fullWidth = true,
                                 onClick = {
-                                    if (step < 5) step++
-                                    else showSuccess = true
+                                    if (!plansVm.isCreating) {
+                                        if (step < 5) {
+                                            step++
+                                        } else {
+                                            val comp = companion
+                                            if (comp != null) {
+                                                plansVm.createPlan(
+                                                    companionId = comp.id,
+                                                    companionIsGroup = comp.isGroup,
+                                                    title = title,
+                                                    placeNames = SampleData.places
+                                                        .filter { selectedPlaceIDs.contains(it.id) }
+                                                        .map { it.name },
+                                                    voteUntilMs = deadline.voteUntilMillis(),
+                                                ) { ok -> if (ok) showSuccess = true }
+                                            }
+                                        }
+                                    }
                                 },
                                 modifier = Modifier.padding(horizontal = 18.dp, vertical = 16.dp).navigationBarsPadding()
                             )
@@ -300,63 +358,72 @@ private fun Stage0Title(title: String, desc: String, onTitleChange: (String) -> 
     }
 }
 
-// Stage 1 — Companion
+// Stage 1 — Companion (real friends + groups from app state)
 @Composable
-private fun Stage1Companion(companion: CompanionSelection?, onSelect: (CompanionSelection) -> Unit) {
+private fun Stage1Companion(
+    companion: CompanionSelection?,
+    friends: List<HHUser>,
+    groups: List<ChatDto>,
+    onSelect: (CompanionSelection) -> Unit,
+) {
     val c = hh
-    val groups = listOf(Triple("g1","⚾","Baseball Buddies" to 4), Triple("g2","🥞","The Brunch Club" to 6))
-    val friends = SampleData.users.drop(1).take(4)
-
     Column(modifier = Modifier.padding(top = 8.dp)) {
-        StageHeader("Step 2", "Who's this with?", "Pick a friend, group, or recent chat.")
+        StageHeader("Step 2", "Who's this with?", "Pick a friend or a group.")
 
         Column(modifier = Modifier.padding(horizontal = 18.dp), verticalArrangement = Arrangement.spacedBy(0.dp)) {
-            // search hint
-            Surface(shape = CircleShape, color = c.surface, border = BorderStroke(1.dp, c.stroke), modifier = Modifier.fillMaxWidth().padding(bottom = 14.dp)) {
-                Row(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("🔍", fontSize = 16.sp)
-                    Text("Search friends or groups…", style = HHType.bodySm, color = c.inkDim)
-                }
+            if (groups.isEmpty() && friends.isEmpty()) {
+                Text(
+                    "No friends or groups yet — add friends from the Circles tab first.",
+                    style = HHType.bodySm,
+                    color = c.inkMute,
+                )
             }
 
-            MonoLabel("Groups"); Spacer(Modifier.height(10.dp))
-            groups.forEach { (id, emoji, meta) ->
-                val sel = companion?.id == id
-                Surface(
-                    onClick = { onSelect(CompanionSelection(id, meta.first, emoji, meta.second, true)) },
-                    shape = RoundedCornerShape(HHRadius.lg),
-                    color = if (sel) c.accentSoft else c.surface,
-                    border = BorderStroke(if (sel) 1.5.dp else 1.dp, if (sel) c.accent else c.stroke),
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                ) {
-                    Row(modifier = Modifier.padding(14.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Box(contentAlignment = Alignment.Center, modifier = Modifier.size(40.dp).clip(RoundedCornerShape(HHRadius.md)).background(c.bgElev)) { Text(emoji, fontSize = 20.sp) }
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(meta.first, style = HHType.bodyMd, fontWeight = FontWeight.Bold, color = c.ink)
-                            Text("${meta.second} members", style = HHType.caption, color = c.inkMute)
+            if (groups.isNotEmpty()) {
+                MonoLabel("Groups"); Spacer(Modifier.height(10.dp))
+                groups.forEach { group ->
+                    val sel = companion?.id == group.id
+                    val emoji = group.emoji ?: "👥"
+                    val name = group.name ?: "Group"
+                    Surface(
+                        onClick = { onSelect(CompanionSelection(group.id, name, emoji, group.members.size, true)) },
+                        shape = RoundedCornerShape(HHRadius.lg),
+                        color = if (sel) c.accentSoft else c.surface,
+                        border = BorderStroke(if (sel) 1.5.dp else 1.dp, if (sel) c.accent else c.stroke),
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                    ) {
+                        Row(modifier = Modifier.padding(14.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Box(contentAlignment = Alignment.Center, modifier = Modifier.size(40.dp).clip(RoundedCornerShape(HHRadius.md)).background(c.bgElev)) { Text(emoji, fontSize = 20.sp) }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(name, style = HHType.bodyMd, fontWeight = FontWeight.Bold, color = c.ink)
+                                Text("${group.members.size} members", style = HHType.caption, color = c.inkMute)
+                            }
+                            if (sel) Icon(Icons.Default.Check, null, tint = c.accent, modifier = Modifier.size(18.dp))
                         }
-                        if (sel) Icon(Icons.Default.Check, null, tint = c.accent, modifier = Modifier.size(18.dp))
                     }
                 }
+                Spacer(Modifier.height(6.dp))
             }
 
-            Spacer(Modifier.height(6.dp)); MonoLabel("Friends"); Spacer(Modifier.height(10.dp))
-            friends.forEach { u ->
-                val sel = companion?.id == u.id
-                Surface(
-                    onClick = { onSelect(CompanionSelection(u.id, u.name, u.avatar, null, false)) },
-                    shape = RoundedCornerShape(HHRadius.md),
-                    color = if (sel) c.accentSoft else Color.Transparent,
-                    border = BorderStroke(1.dp, if (sel) c.accent else Color.Transparent),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Row(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        AvatarView(user = u, size = 36.dp)
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(u.name, style = HHType.bodyMd, fontWeight = FontWeight.SemiBold, color = c.ink)
-                            Text(u.status.label, style = HHType.caption, color = c.inkMute)
+            if (friends.isNotEmpty()) {
+                MonoLabel("Friends"); Spacer(Modifier.height(10.dp))
+                friends.forEach { u ->
+                    val sel = companion?.id == u.id
+                    Surface(
+                        onClick = { onSelect(CompanionSelection(u.id, u.name, u.avatar, null, false)) },
+                        shape = RoundedCornerShape(HHRadius.md),
+                        color = if (sel) c.accentSoft else Color.Transparent,
+                        border = BorderStroke(1.dp, if (sel) c.accent else Color.Transparent),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            AvatarView(user = u, size = 36.dp)
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(u.name, style = HHType.bodyMd, fontWeight = FontWeight.SemiBold, color = c.ink)
+                                Text(u.status.label, style = HHType.caption, color = c.inkMute)
+                            }
+                            if (sel) Icon(Icons.Default.Check, null, tint = c.accent, modifier = Modifier.size(16.dp))
                         }
-                        if (sel) Icon(Icons.Default.Check, null, tint = c.accent, modifier = Modifier.size(16.dp))
                     }
                 }
             }

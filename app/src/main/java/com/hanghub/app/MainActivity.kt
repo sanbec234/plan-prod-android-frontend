@@ -1,51 +1,3 @@
-//package com.hanghub.app
-//
-//import android.os.Bundle
-//import androidx.activity.ComponentActivity
-//import androidx.activity.compose.setContent
-//import androidx.activity.enableEdgeToEdge
-//import androidx.compose.foundation.layout.fillMaxSize
-//import androidx.compose.foundation.layout.padding
-//import androidx.compose.material3.Scaffold
-//import androidx.compose.material3.Text
-//import androidx.compose.runtime.Composable
-//import androidx.compose.ui.Modifier
-//import androidx.compose.ui.tooling.preview.Preview
-//import com.hanghub.app.ui.theme.PlanTheme
-//
-//class MainActivity : ComponentActivity() {
-//    override fun onCreate(savedInstanceState: Bundle?) {
-//        super.onCreate(savedInstanceState)
-//        enableEdgeToEdge()
-//        setContent {
-//            PlanTheme {
-//                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-//                    Greeting(
-//                        name = "Android",
-//                        modifier = Modifier.padding(innerPadding)
-//                    )
-//                }
-//            }
-//        }
-//    }
-//}
-//
-//@Composable
-//fun Greeting(name: String, modifier: Modifier = Modifier) {
-//    Text(
-//        text = "Hello $name!",
-//        modifier = modifier
-//    )
-//}
-//
-//@Preview(showBackground = true)
-//@Composable
-//fun GreetingPreview() {
-//    PlanTheme {
-//        Greeting("Android")
-//    }
-//}
-
 package com.hanghub.app
 
 import android.os.Bundle
@@ -62,6 +14,7 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -84,6 +37,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
+	import androidx.compose.runtime.LaunchedEffect
 	import androidx.compose.runtime.getValue
 	import androidx.compose.runtime.mutableStateOf
 	import androidx.compose.runtime.remember
@@ -98,7 +52,17 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.annotation.DrawableRes
-import androidx.navigation.compose.rememberNavController
+import android.content.Intent
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.hanghub.app.core.appContainer
+import com.hanghub.app.core.push.DeepLinkHandler
+import com.hanghub.app.core.push.DeepLinkTarget
+import com.hanghub.app.core.viewModelFactory
+import com.hanghub.app.ui.auth.AuthScreen
+import com.hanghub.app.ui.state.AppStateViewModel
+import com.hanghub.app.ui.state.LocalAppState
 import com.hanghub.app.ui.screens.CirclesScreen
 import com.hanghub.app.ui.screens.CreatePlanFlow
 import com.hanghub.app.ui.screens.PlansScreen
@@ -121,11 +85,50 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        DeepLinkHandler.handleIntent(intent)
         setContent {
-            HangHubTheme {
-                HangHubApp()
+            val container = appContainer()
+            val appState: AppStateViewModel = viewModel(
+                factory = viewModelFactory {
+                    AppStateViewModel(
+                        container.authRepository,
+                        container.planRepository,
+                        container.friendsRepository,
+                        container.chatRepository,
+                        container.webSocketManager,
+                        container.appPreferences,
+                        container.localCache,
+                        container.networkMonitor,
+                    )
+                }
+            )
+            // Register the FCM token once authenticated (best-effort).
+            LaunchedEffect(appState.isAuthenticated) {
+                if (appState.isAuthenticated) container.pushTokenRegistrar.register()
+            }
+            val darkTheme = when (appState.themeMode) {
+                "light" -> false
+                "dark" -> true
+                else -> isSystemInDarkTheme()
+            }
+            HangHubTheme(darkTheme = darkTheme) {
+                // Auth gate — sign-in screen until a session exists.
+                if (appState.isAuthenticated) {
+                    HangHubApp(appState)
+                } else {
+                    AuthScreen(
+                        container = container,
+                        onAuthenticated = appState::onSignedIn,
+                    )
+                }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        DeepLinkHandler.handleIntent(intent)
     }
 }
 
@@ -143,9 +146,8 @@ enum class AppTab(val label: String, @DrawableRes val iconRes: Int, val route: S
 data class ToastData(val text: String, val sub: String? = null, val id: Long = System.currentTimeMillis())
 
 @Composable
-	fun HangHubApp() {
+	fun HangHubApp(appState: AppStateViewModel) {
 	    val c = hh
-	    val navController = rememberNavController()
 	    var activeTab by remember { mutableStateOf(AppTab.SCOUT) }
 	    var showCreatePlan by remember { mutableStateOf(false) }
 	    var toast by remember { mutableStateOf<ToastData?>(null) }
@@ -160,7 +162,22 @@ data class ToastData(val text: String, val sub: String? = null, val id: Long = S
         }
     }
 
-	    CompositionLocalProvider(LocalAppChrome provides chrome) {
+    // Refresh when the app returns to the foreground (Android "background refresh"
+    // equivalent — WorkManager was intentionally not added to the dependency set).
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        appState.loadInitialData()
+    }
+
+    // Route notification taps (deep links) to the matching tab.
+    LaunchedEffect(DeepLinkHandler.pending) {
+        when (DeepLinkHandler.consume()) {
+            is DeepLinkTarget.Chat -> activeTab = AppTab.CIRCLES
+            is DeepLinkTarget.Plan -> activeTab = AppTab.PLANS
+            null -> Unit
+        }
+    }
+
+	    CompositionLocalProvider(LocalAppChrome provides chrome, LocalAppState provides appState) {
 	        // Hide tab bar while CreatePlanFlow is shown
 	        DisposableEffect(showCreatePlan) {
 	            val pop = if (showCreatePlan) chrome.pushTabBarHidden() else null
@@ -208,6 +225,16 @@ data class ToastData(val text: String, val sub: String? = null, val id: Long = S
             exit  = slideOutVertically { -it } + fadeOut(),
         ) {
             toast?.let { ToastView(it) }
+        }
+
+        // ── Offline banner ──────────────────────────────────────────────
+        AnimatedVisibility(
+            visible = appState.isOffline,
+            modifier = Modifier.align(Alignment.TopCenter).padding(top = 12.dp),
+            enter = slideInVertically { -it } + fadeIn(),
+            exit  = slideOutVertically { -it } + fadeOut(),
+        ) {
+            OfflineBanner()
         }
 
 	        // ── Create Plan Sheet ──────────────────────────────────────────
@@ -309,6 +336,25 @@ fun TabPill(tab: AppTab, isActive: Boolean, onClick: () -> Unit) {
 // ═══════════════════════════════════════════════════════════════════════════
 // MARK: ToastView
 // ═══════════════════════════════════════════════════════════════════════════
+
+@Composable
+fun OfflineBanner() {
+    val c = hh
+    Surface(
+        shape = RoundedCornerShape(com.hanghub.app.ui.theme.HHRadius.lg),
+        color = c.ink,
+        shadowElevation = 8.dp,
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+        ) {
+            Text("⚡", fontSize = 13.sp)
+            Text("You're offline — showing cached data", style = HHType.caption, color = c.bg)
+        }
+    }
+}
 
 @Composable
 fun ToastView(data: ToastData) {
