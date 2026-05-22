@@ -49,6 +49,9 @@ class AppStateViewModel(
 
     private var realtimeStarted = false
 
+    /** Raw DM chat payloads — kept so [chats] can be re-derived when friends load. */
+    private var rawChats: List<ChatDto> = emptyList()
+
     /** Theme preference: "system" | "light" | "dark". */
     var themeMode by mutableStateOf(appPreferences.themeMode)
         private set
@@ -138,10 +141,13 @@ class AppStateViewModel(
         viewModelScope.launch {
             webSocketManager.events.collect { event ->
                 when (event) {
-                    is WsEvent.NewMessage -> refreshChats()
+                    is WsEvent.IncomingMessage -> refreshChats()
                     is WsEvent.PlanUpdated -> refreshPlans()
-                    is WsEvent.Typing -> setChatTyping(event.chatId, event.isTyping)
+                    is WsEvent.Typing -> setChatTyping(event.roomId, event.isTyping)
                     is WsEvent.Connection -> { /* connection state — no-op here */ }
+                    // Ack / delete / room-joined are handled by the open chat
+                    // screen's own ViewModel, not the app-wide state.
+                    else -> Unit
                 }
             }
         }
@@ -271,18 +277,26 @@ class AppStateViewModel(
             is ApiResult.Success -> {
                 friends = result.data.map { it.toHHUser() }
                 localCache.saveFriends(result.data)
+                // Friends may finish loading after chats — re-derive partner names.
+                rebuildChats()
             }
             is ApiResult.Failure -> handleError(result.error)
         }
     }
 
+    /** Re-derive the [chats] UI list from [rawChats], resolving names via [friends]. */
+    private fun rebuildChats() {
+        chats = rawChats
+            .filter { !it.isGroup && it.id.isNotBlank() }
+            .map { it.toHHChat(currentUserId, friends) }
+            .distinctBy { it.id }
+    }
+
     private suspend fun loadChats() {
         when (val result = chatRepository.getChats()) {
             is ApiResult.Success -> {
-                chats = result.data
-                    .filter { !it.isGroup && it.id.isNotBlank() }
-                    .map { it.toHHChat(currentUserId) }
-                    .distinctBy { it.id }
+                rawChats = result.data
+                rebuildChats()
                 localCache.saveChats(result.data)
             }
             is ApiResult.Failure -> handleError(result.error)
@@ -313,9 +327,8 @@ class AppStateViewModel(
         }
         if (chats.isEmpty()) {
             localCache.loadChats()?.let { cached ->
-                chats = cached.filter { !it.isGroup && it.id.isNotBlank() }
-                    .map { it.toHHChat(currentUserId) }
-                    .distinctBy { it.id }
+                rawChats = cached
+                rebuildChats()
             }
         }
         if (groups.isEmpty()) {

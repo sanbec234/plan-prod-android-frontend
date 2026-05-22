@@ -113,7 +113,42 @@ data class ChatMessage(
     val id: String = "",
     val senderName: String = "",
     val pending: Boolean = false,
+    /** Server-assigned ordering sequence; 0 until the send is acked. */
+    val seq: Long = 0,
+    /** Typed payload for non-text messages; null for plain optimistic text. */
+    val payload: MessagePayload? = null,
 )
+
+/**
+ * Typed chat message payload — the client-side counterpart of the backend's
+ * discriminated `MessagePayload` union. [ChatMessage.text] always carries a
+ * display-ready string; this exposes the structured data for rich rendering.
+ */
+sealed interface MessagePayload {
+    data class Text(val text: String) : MessagePayload
+    data class Image(
+        val uploadUrl: String,
+        val thumbnailUrl: String,
+        val width: Int,
+        val height: Int,
+    ) : MessagePayload
+    data class LocationPin(
+        val lat: Double,
+        val lng: Double,
+        val placeName: String,
+        val address: String?,
+        val deepLinkUrl: String,
+    ) : MessagePayload
+    data class PlanCard(
+        val planId: String,
+        val title: String,
+        val venueName: String?,
+        val planStatus: String,
+    ) : MessagePayload
+    data class SystemNote(val subtype: String, val text: String) : MessagePayload
+    /** A payload type this client build does not recognise. */
+    data object Unknown : MessagePayload
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MARK: Sample Data — mirrors data.jsx 1-to-1

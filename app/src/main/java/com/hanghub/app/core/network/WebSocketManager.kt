@@ -1,7 +1,7 @@
 package com.hanghub.app.core.network
 
 import com.hanghub.app.core.Config
-import com.hanghub.app.core.util.Dates
+import com.hanghub.app.data.dto.MessageEnvelopeDto
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -13,37 +13,46 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
+import kotlinx.serialization.json.put
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
-import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Realtime events surfaced to the app from the chat WebSocket. */
 sealed interface WsEvent {
-    data class NewMessage(
-        val chatId: String,
-        val id: String,
-        val senderId: String,
-        val senderName: String,
-        val text: String,
-        val timestamp: String,
+    /** A `chat:message` — a new live message or one delivered via join replay. */
+    data class IncomingMessage(val message: MessageEnvelopeDto) : WsEvent
+
+    /** Server confirmation that one of our sends was persisted. */
+    data class MessageAck(
+        val clientMessageId: String?,
+        val messageId: String,
+        val seq: Long,
     ) : WsEvent
 
-    data class Typing(val chatId: String, val userId: String, val isTyping: Boolean) : WsEvent
+    data class MessageDeleted(val roomId: String, val messageId: String) : WsEvent
+    data class Typing(val roomId: String, val userId: String, val isTyping: Boolean) : WsEvent
+    data class RoomJoined(val roomId: String) : WsEvent
     data class PlanUpdated(val chatId: String) : WsEvent
     data class Connection(val connected: Boolean) : WsEvent
 }
 
 /**
- * Single WebSocket connection to the backend chat server. Mirrors the iOS
- * `WebSocketManager`: connects with the JWT as a query param, auto-reconnects
- * with exponential backoff, and surfaces incoming events as a [SharedFlow].
+ * Single WebSocket connection to the backend chat server, speaking the
+ * modern `chat:*` protocol (`chat:join` / `chat:message` / `chat:typing`,
+ * with server-assigned `seq`, `clientMessageId` idempotency and message
+ * replay). Connects with the JWT as a query param and auto-reconnects with
+ * exponential backoff.
+ *
+ * `chat:message` sends are queued while the socket is down and flushed on
+ * reconnect, so a message composed offline is not silently lost.
  */
 class WebSocketManager(
     private val okHttpClient: OkHttpClient,
@@ -60,6 +69,10 @@ class WebSocketManager(
     private var reconnectJob: Job? = null
     private val reconnectAttempt = AtomicInteger(0)
     @Volatile private var intentionallyClosed = false
+
+    /** `chat:message` frames composed while the socket was down. */
+    private val outbox = ArrayDeque<String>()
+    private val outboxLock = Any()
 
     fun connect() {
         val token = tokenProvider() ?: return
@@ -80,57 +93,89 @@ class WebSocketManager(
         webSocket = null
     }
 
-    fun joinChat(chatId: String) {
-        send(buildString {
-            append("{\"type\":\"join_chat\",\"chatId\":")
-            append("\"").append(chatId).append("\"}")
+    // ── Modern chat:* protocol — outbound ───────────────────────────────────
+
+    /**
+     * Join a chat room. [lastSeenSeq] asks the server to replay every message
+     * after that sequence as `chat:message` events — closing any gap from
+     * while the socket was disconnected.
+     */
+    fun joinRoom(roomId: String, lastSeenSeq: Long) {
+        send(buildJsonObject {
+            put("type", "chat:join")
+            put("roomId", roomId)
+            put("lastSeenSeq", lastSeenSeq)
         })
     }
 
-    /** Send a chat message over the socket. Returns the client message id. */
-    fun sendMessage(
-        chatId: String,
-        senderId: String,
-        senderName: String,
-        text: String,
-    ): String {
-        val msgId = UUID.randomUUID().toString()
-        val payload = JsonValue.obj(
-            "type" to JsonValue.str("message_sent"),
-            "chatId" to JsonValue.str(chatId),
-            "message" to JsonValue.obj(
-                "id" to JsonValue.str(msgId),
-                "clientMessageId" to JsonValue.str(msgId),
-                "senderId" to JsonValue.str(senderId),
-                "senderName" to JsonValue.str(senderName),
-                "messageType" to JsonValue.str("text"),
-                "text" to JsonValue.str(text),
-                "timestamp" to JsonValue.str(Dates.nowIso()),
-            ),
-        )
-        send(payload)
-        return msgId
+    fun leaveRoom(roomId: String) {
+        send(buildJsonObject {
+            put("type", "chat:leave")
+            put("roomId", roomId)
+        })
     }
 
-    fun sendTyping(chatId: String, userId: String, isTyping: Boolean) {
-        send(
-            JsonValue.obj(
-                "type" to JsonValue.str("typing"),
-                "chatId" to JsonValue.str(chatId),
-                "userId" to JsonValue.str(userId),
-                "isTyping" to JsonValue.bool(isTyping),
-            )
-        )
+    /**
+     * Send a chat message. [id] and [clientMessageId] are pre-generated by the
+     * caller so the optimistic UI row can be reconciled with the server echo /
+     * ack, and so a retry is idempotent. Queued if the socket is down.
+     */
+    fun sendChatMessage(
+        roomId: String,
+        messageType: String,
+        payload: JsonObject,
+        id: String,
+        clientMessageId: String,
+    ) {
+        val frame = buildJsonObject {
+            put("type", "chat:message")
+            put("roomId", roomId)
+            put("messageType", messageType)
+            put("id", id)
+            put("clientMessageId", clientMessageId)
+            put("payload", payload)
+        }.toString()
+
+        if (!sendRaw(frame)) {
+            synchronized(outboxLock) { outbox.addLast(frame) }
+        }
     }
 
-    private fun send(raw: String) {
-        webSocket?.send(raw)
+    fun sendTyping(roomId: String, isTyping: Boolean) {
+        send(buildJsonObject {
+            put("type", "chat:typing")
+            put("roomId", roomId)
+            put("isTyping", isTyping)
+        })
     }
+
+    private fun send(obj: JsonObject) {
+        sendRaw(obj.toString())
+    }
+
+    /** Returns true if the frame was handed to an open socket. */
+    private fun sendRaw(raw: String): Boolean = webSocket?.send(raw) ?: false
+
+    private fun flushOutbox() {
+        val pending: List<String>
+        synchronized(outboxLock) {
+            pending = outbox.toList()
+            outbox.clear()
+        }
+        for (frame in pending) {
+            if (!sendRaw(frame)) {
+                synchronized(outboxLock) { outbox.addLast(frame) }
+            }
+        }
+    }
+
+    // ── Connection lifecycle ────────────────────────────────────────────────
 
     private val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             reconnectAttempt.set(0)
             _events.tryEmit(WsEvent.Connection(true))
+            flushOutbox()
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
@@ -158,62 +203,63 @@ class WebSocketManager(
         }
     }
 
+    // ── Incoming ────────────────────────────────────────────────────────────
+
     private fun handleIncoming(text: String) {
         val obj = try {
             json.parseToJsonElement(text) as? JsonObject ?: return
         } catch (_: Exception) {
             return
         }
-        when (obj["type"]?.jsonPrimitive?.contentOrNull) {
-            "message_sent", "receive_message" -> {
-                val chatId = obj.str("chatId") ?: return
-                val msg = obj["message"]?.jsonObject ?: return
-                _events.tryEmit(
-                    WsEvent.NewMessage(
-                        chatId = chatId,
-                        id = msg.str("id") ?: UUID.randomUUID().toString(),
-                        senderId = msg.str("senderId") ?: "",
-                        senderName = msg.str("senderName") ?: "",
-                        text = msg.str("text") ?: "",
-                        timestamp = msg.str("timestamp") ?: Dates.nowIso(),
-                    )
-                )
-            }
+        when (obj.str("type")) {
             "chat:message" -> {
-                val msg = obj["message"]?.jsonObject ?: return
-                val roomId = msg.str("roomId") ?: return
-                val payloadText = msg["payload"]?.jsonObject?.str("text") ?: ""
+                val msgEl = obj["message"] ?: return
+                val envelope = try {
+                    json.decodeFromJsonElement(MessageEnvelopeDto.serializer(), msgEl)
+                } catch (_: Exception) {
+                    return
+                }
+                _events.tryEmit(WsEvent.IncomingMessage(envelope))
+            }
+            "chat:message_ack" -> {
+                val messageId = obj.str("messageId") ?: return
                 _events.tryEmit(
-                    WsEvent.NewMessage(
-                        chatId = roomId,
-                        id = msg.str("id") ?: UUID.randomUUID().toString(),
-                        senderId = msg.str("senderId") ?: "",
-                        senderName = msg.str("senderName") ?: "",
-                        text = payloadText,
-                        timestamp = msg.str("createdAt") ?: Dates.nowIso(),
+                    WsEvent.MessageAck(
+                        clientMessageId = obj.str("clientMessageId"),
+                        messageId = messageId,
+                        seq = obj["seq"]?.jsonPrimitive?.longOrNull ?: 0,
                     )
                 )
             }
-            "typing" -> {
-                val chatId = obj.str("chatId") ?: return
+            "chat:message_deleted" -> {
+                val roomId = obj.str("roomId") ?: return
+                val messageId = obj.str("messageId") ?: return
+                _events.tryEmit(WsEvent.MessageDeleted(roomId, messageId))
+            }
+            "chat:typing" -> {
+                val roomId = obj.str("roomId") ?: return
                 val userId = obj.str("userId") ?: return
-                val isTyping = obj["isTyping"]?.jsonPrimitive?.booleanOrNull ?: false
-                _events.tryEmit(WsEvent.Typing(chatId, userId, isTyping))
+                _events.tryEmit(
+                    WsEvent.Typing(
+                        roomId = roomId,
+                        userId = userId,
+                        isTyping = obj["isTyping"]?.jsonPrimitive?.booleanOrNull ?: false,
+                    )
+                )
+            }
+            "chat:joined", "joined_chat" -> {
+                val roomId = obj.str("roomId") ?: obj.str("chatId") ?: return
+                _events.tryEmit(WsEvent.RoomJoined(roomId))
             }
             "plan_updated", "plan_state_changed", "plan_locked", "vote_cast", "rsvp_updated" -> {
                 obj.str("chatId")?.let { _events.tryEmit(WsEvent.PlanUpdated(it)) }
             }
+            // `message_sent` / `receive_message` / `typing` are the legacy
+            // event names the same payload is also broadcast under for older
+            // iOS clients — ignored here to avoid double-handling.
         }
     }
 
     private fun JsonObject.str(key: String): String? =
         this[key]?.jsonPrimitive?.contentOrNull
-}
-
-/** Tiny JSON builder to avoid manual string concatenation for outgoing frames. */
-private object JsonValue {
-    fun str(v: String): String = "\"" + v.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
-    fun bool(v: Boolean): String = v.toString()
-    fun obj(vararg pairs: Pair<String, String>): String =
-        pairs.joinToString(",", "{", "}") { (k, v) -> "\"$k\":$v" }
 }

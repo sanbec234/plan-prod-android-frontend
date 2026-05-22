@@ -9,18 +9,24 @@ import com.hanghub.app.core.network.ApiResult
 import com.hanghub.app.core.network.WebSocketManager
 import com.hanghub.app.core.network.WsEvent
 import com.hanghub.app.data.ChatMessage
+import com.hanghub.app.data.dto.MessageEnvelopeDto
 import com.hanghub.app.data.repository.ChatRepository
 import com.hanghub.app.data.toChatMessage
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import java.util.UUID
 
 /**
- * Drives a single open chat thread: message history, sending, the typing
- * indicator, and live inbound messages over the WebSocket.
+ * Drives a single open chat thread on the modern `chat:*` protocol: loads
+ * history over REST, joins the room over the WebSocket with a replay cursor,
+ * sends messages with optimistic echo, and reconciles them against the
+ * server's `chat:message` / `chat:message_ack`.
  */
 class ChatViewModel(
-    private val chatId: String,
+    private val roomId: String,
     private val currentUserId: String,
     private val chatRepository: ChatRepository,
     private val webSocketManager: WebSocketManager,
@@ -37,24 +43,34 @@ class ChatViewModel(
     var partnerTyping by mutableStateOf(false)
         private set
 
+    /** Highest server `seq` seen — the replay cursor for (re)joins. */
+    private var lastSeenSeq = 0L
     private var typingJob: Job? = null
+    private var joined = false
 
     init {
-        webSocketManager.joinChat(chatId)
-        loadMessages()
         observeRealtime()
+        loadHistoryThenJoin()
     }
 
-    fun loadMessages() {
+    private fun loadHistoryThenJoin() {
         viewModelScope.launch {
             isLoading = messages.isEmpty()
             error = null
-            when (val result = chatRepository.getMessages(chatId)) {
-                is ApiResult.Success ->
-                    messages = result.data.map { it.toChatMessage(currentUserId) }
+            when (val result = chatRepository.getRoomMessages(roomId)) {
+                is ApiResult.Success -> {
+                    val ordered = result.data.messages.sortedBy { it.seq }
+                    messages = ordered.map { it.toChatMessage(currentUserId) }
+                    lastSeenSeq = ordered.maxOfOrNull { it.seq } ?: 0L
+                }
                 is ApiResult.Failure -> error = result.error.message
             }
             isLoading = false
+            // Join after history so replay only backfills the gap since
+            // [lastSeenSeq]. If the history fetch failed, lastSeenSeq is 0 and
+            // the join replay backfills the recent history over the socket.
+            webSocketManager.joinRoom(roomId, lastSeenSeq)
+            joined = true
         }
     }
 
@@ -62,23 +78,29 @@ class ChatViewModel(
         viewModelScope.launch {
             webSocketManager.events.collect { event ->
                 when (event) {
-                    is WsEvent.NewMessage ->
-                        // Only inbound messages from others — own sends reload via REST.
-                        if (event.chatId == chatId && event.senderId != currentUserId) {
-                            if (messages.none { it.id == event.id }) {
-                                messages = messages + ChatMessage(
-                                    from = event.senderId,
-                                    text = event.text,
-                                    time = "now",
-                                    id = event.id,
-                                    senderName = event.senderName,
-                                )
+                    is WsEvent.IncomingMessage ->
+                        if (event.message.roomId == roomId) applyIncoming(event.message)
+                    is WsEvent.MessageAck ->
+                        messages = messages.map {
+                            if (it.id == event.messageId) {
+                                it.copy(pending = false, seq = event.seq)
+                            } else {
+                                it
                             }
-                            partnerTyping = false
+                        }
+                    is WsEvent.MessageDeleted ->
+                        if (event.roomId == roomId) {
+                            messages = messages.filterNot { it.id == event.messageId }
                         }
                     is WsEvent.Typing ->
-                        if (event.chatId == chatId && event.userId != currentUserId) {
+                        if (event.roomId == roomId && event.userId != currentUserId) {
                             partnerTyping = event.isTyping
+                        }
+                    is WsEvent.Connection ->
+                        // Re-join after a reconnect to replay anything missed
+                        // while the socket was down.
+                        if (event.connected && joined) {
+                            webSocketManager.joinRoom(roomId, lastSeenSeq)
                         }
                     else -> Unit
                 }
@@ -86,14 +108,27 @@ class ChatViewModel(
         }
     }
 
+    private fun applyIncoming(envelope: MessageEnvelopeDto) {
+        if (envelope.seq > lastSeenSeq) lastSeenSeq = envelope.seq
+        val incoming = envelope.toChatMessage(currentUserId)
+        val idx = messages.indexOfFirst { it.id == incoming.id }
+        messages = if (idx >= 0) {
+            // Reconcile our optimistic copy, or dedupe a replayed message.
+            messages.toMutableList().also { it[idx] = incoming }
+        } else {
+            messages + incoming
+        }
+        if (envelope.senderId != currentUserId) partnerTyping = false
+    }
+
     fun onDraftChange(text: String) {
         draft = text
-        webSocketManager.sendTyping(chatId, currentUserId, text.isNotEmpty())
+        webSocketManager.sendTyping(roomId, text.isNotEmpty())
         typingJob?.cancel()
         if (text.isNotEmpty()) {
             typingJob = viewModelScope.launch {
                 delay(3000)
-                webSocketManager.sendTyping(chatId, currentUserId, false)
+                webSocketManager.sendTyping(roomId, false)
             }
         }
     }
@@ -103,22 +138,25 @@ class ChatViewModel(
         if (text.isEmpty()) return
         draft = ""
         typingJob?.cancel()
-        webSocketManager.sendTyping(chatId, currentUserId, false)
+        webSocketManager.sendTyping(roomId, false)
 
-        // Optimistic — replaced by the server list once the send confirms.
+        // Pre-generate the id so the optimistic row, the server echo, and the
+        // ack all share it — the send is idempotent and reconciles in place.
+        val id = UUID.randomUUID().toString()
+        webSocketManager.sendChatMessage(
+            roomId = roomId,
+            messageType = "text",
+            payload = buildJsonObject { put("text", text) },
+            id = id,
+            clientMessageId = id,
+        )
+
         messages = messages + ChatMessage(
             from = "me",
             text = text,
             time = "now",
-            id = "local-${System.currentTimeMillis()}",
+            id = id,
             pending = true,
         )
-
-        viewModelScope.launch {
-            when (val result = chatRepository.sendMessage(chatId, text)) {
-                is ApiResult.Success -> loadMessages()
-                is ApiResult.Failure -> error = result.error.message
-            }
-        }
     }
 }

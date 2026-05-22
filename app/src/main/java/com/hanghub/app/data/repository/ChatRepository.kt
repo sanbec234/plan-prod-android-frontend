@@ -9,6 +9,7 @@ import com.hanghub.app.data.dto.AddMembersRequest
 import com.hanghub.app.data.dto.ChatDto
 import com.hanghub.app.data.dto.CreateChatRequest
 import com.hanghub.app.data.dto.MessageDto
+import com.hanghub.app.data.dto.MessagesPageDto
 import com.hanghub.app.data.dto.SendMessageRequest
 import com.hanghub.app.data.dto.UpdateGroupRequest
 
@@ -26,6 +27,17 @@ class ChatRepository(private val api: ApiService) {
 
     suspend fun getMessages(chatId: String): ApiResult<List<MessageDto>> =
         safeApiCall { api.getMessages(chatId) }
+
+    /**
+     * Modern chat history — newest [limit] messages of a room (descending),
+     * or the page before [cursor] when paginating older history.
+     */
+    suspend fun getRoomMessages(
+        roomId: String,
+        cursor: Long? = null,
+        limit: Int = 50,
+    ): ApiResult<MessagesPageDto> =
+        safeApiCall { api.getRoomMessages(roomId, cursor, limit, "before") }
 
     suspend fun createChat(
         memberIds: List<String>,

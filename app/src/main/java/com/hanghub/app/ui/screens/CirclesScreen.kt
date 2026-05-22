@@ -482,7 +482,7 @@ fun ChatScreen(chat: HHChat, onDismiss: () -> Unit) {
         key = "chat-${chat.id}",
         factory = viewModelFactory {
             ChatViewModel(
-                chatId = chat.id,
+                roomId = chat.id,
                 currentUserId = appState.currentUserId,
                 chatRepository = container.chatRepository,
                 webSocketManager = container.webSocketManager,
@@ -606,7 +606,19 @@ fun ChatScreen(chat: HHChat, onDismiss: () -> Unit) {
 @Composable
 private fun BubbleView(message: ChatMessage) {
     val c = hh
+
+    // System notes render as a centered, muted line — not a chat bubble.
+    val payload = message.payload
+    if (payload is MessagePayload.SystemNote) {
+        Box(Modifier.fillMaxWidth().padding(vertical = 2.dp), contentAlignment = Alignment.Center) {
+            Text(payload.text, style = HHType.caption, color = c.inkMute)
+        }
+        return
+    }
+
     val isMine = message.from == "me"
+    val fg = if (isMine) c.onAccent else c.ink
+    val subFg = if (isMine) c.onAccent.copy(alpha = 0.7f) else c.inkMute
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = if (isMine) Arrangement.End else Arrangement.Start) {
         if (isMine) Spacer(Modifier.weight(1f).widthIn(min = 60.dp))
         Surface(
@@ -614,12 +626,26 @@ private fun BubbleView(message: ChatMessage) {
             color = if (isMine) c.accent else c.surface,
             border = if (isMine) null else BorderStroke(1.dp, c.stroke),
         ) {
-            Text(
-                message.text,
-                style = HHType.body,
-                color = if (isMine) c.onAccent else c.ink,
-                modifier = Modifier.padding(horizontal = 13.dp, vertical = 9.dp)
-            )
+            Column(modifier = Modifier.padding(horizontal = 13.dp, vertical = 9.dp)) {
+                when (payload) {
+                    is MessagePayload.LocationPin -> {
+                        Text("📍 ${payload.placeName}", style = HHType.body, fontWeight = FontWeight.SemiBold, color = fg)
+                        payload.address?.takeIf { it.isNotBlank() }?.let {
+                            Text(it, style = HHType.caption, color = subFg)
+                        }
+                    }
+                    is MessagePayload.PlanCard -> {
+                        Text("📋 ${payload.title}", style = HHType.body, fontWeight = FontWeight.SemiBold, color = fg)
+                        payload.venueName?.takeIf { it.isNotBlank() }?.let {
+                            Text(it, style = HHType.caption, color = subFg)
+                        }
+                    }
+                    is MessagePayload.Image ->
+                        Text("📷 Photo", style = HHType.body, color = fg)
+                    else ->
+                        Text(message.text, style = HHType.body, color = fg)
+                }
+            }
         }
         if (!isMine) Spacer(Modifier.weight(1f).widthIn(min = 60.dp))
     }

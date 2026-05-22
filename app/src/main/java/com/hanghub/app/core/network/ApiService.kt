@@ -17,6 +17,7 @@ import com.hanghub.app.data.dto.GoogleAuthRequest
 import com.hanghub.app.data.dto.GroupsResponse
 import com.hanghub.app.data.dto.LocationRequest
 import com.hanghub.app.data.dto.MessageDto
+import com.hanghub.app.data.dto.MessagesPageDto
 import com.hanghub.app.data.dto.NotificationReadRequest
 import com.hanghub.app.data.dto.NotificationsResponse
 import com.hanghub.app.data.dto.PlanCreateResponse
@@ -127,6 +128,15 @@ interface ApiService {
 
     @GET("chats/{id}/messages")
     suspend fun getMessages(@Path("id") chatId: String): List<MessageDto>
+
+    /** Modern chat protocol — cursor/seq-paginated message history. */
+    @GET("api/v1/rooms/{roomId}/messages")
+    suspend fun getRoomMessages(
+        @Path("roomId") roomId: String,
+        @Query("cursor") cursor: Long? = null,
+        @Query("limit") limit: Int = 50,
+        @Query("direction") direction: String = "before",
+    ): MessagesPageDto
 
     @POST("chats")
     suspend fun createChat(@Body body: CreateChatRequest): ChatDto

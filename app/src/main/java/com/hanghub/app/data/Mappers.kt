@@ -4,6 +4,12 @@ import com.hanghub.app.core.util.Dates
 import com.hanghub.app.data.dto.ChatDto
 import com.hanghub.app.data.dto.FriendDto
 import com.hanghub.app.data.dto.MessageDto
+import com.hanghub.app.data.dto.MessageEnvelopeDto
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import com.hanghub.app.data.dto.PlaceDto
 import com.hanghub.app.data.dto.PlanDto
 import com.hanghub.app.data.dto.PlanPlaceDto
@@ -132,9 +138,14 @@ fun UserDto.toHHUser(): HHUser = HHUser(
 
 // ── Chat ────────────────────────────────────────────────────────────────────
 
-/** Build the lightweight [HHChat] used in the chats list. */
-fun ChatDto.toHHChat(currentUserId: String): HHChat {
+/**
+ * Build the lightweight [HHChat] used in the chats list. For DMs the partner's
+ * name/avatar may be absent from the chat payload's member list — fall back to
+ * the loaded [friends] list, keyed by the other member's user id.
+ */
+fun ChatDto.toHHChat(currentUserId: String, friends: List<HHUser> = emptyList()): HHChat {
     val other = members.firstOrNull { it.userId != currentUserId }
+    val friend = other?.let { o -> friends.firstOrNull { it.id == o.userId } }
     val last = messages.firstOrNull()
     return HHChat(
         id = id,
@@ -142,8 +153,15 @@ fun ChatDto.toHHChat(currentUserId: String): HHChat {
         lastMessage = last?.content ?: "",
         time = Dates.shortLabel(Dates.parseMillis(last?.createdAt)),
         unread = 0,
-        partnerName = name ?: other?.user?.name ?: "Chat",
-        partnerAvatar = other?.user?.avatarEmoji?.ifBlank { "👤" } ?: "👤",
+        // DM chats are created with an empty `name`, so blank must fall
+        // through to the partner's name rather than short-circuiting here.
+        partnerName = name?.takeIf { it.isNotBlank() }
+            ?: other?.user?.name?.takeIf { it.isNotBlank() }
+            ?: friend?.name?.takeIf { it.isNotBlank() }
+            ?: "Chat",
+        partnerAvatar = other?.user?.avatarEmoji?.takeIf { it.isNotBlank() }
+            ?: friend?.avatar?.takeIf { it.isNotBlank() }
+            ?: "👤",
     )
 }
 
@@ -161,6 +179,66 @@ fun MessageDto.toChatMessage(currentUserId: String): ChatMessage = ChatMessage(
     id = id,
     senderName = senderName,
 )
+
+// ── Modern chat:* message envelope ──────────────────────────────────────────
+
+private fun JsonObject.str(key: String): String? = this[key]?.jsonPrimitive?.contentOrNull
+private fun JsonObject.dbl(key: String): Double? = this[key]?.jsonPrimitive?.doubleOrNull
+private fun JsonObject.int(key: String): Int? = this[key]?.jsonPrimitive?.intOrNull
+
+/** Decode the raw [MessageEnvelopeDto.payload] into a typed [MessagePayload]. */
+fun MessageEnvelopeDto.toMessagePayload(): MessagePayload = when (type) {
+    "text" -> MessagePayload.Text(payload.str("text") ?: "")
+    "image" -> MessagePayload.Image(
+        uploadUrl = payload.str("uploadUrl") ?: "",
+        thumbnailUrl = payload.str("thumbnailUrl") ?: payload.str("uploadUrl") ?: "",
+        width = payload.int("width") ?: 0,
+        height = payload.int("height") ?: 0,
+    )
+    "location_pin" -> MessagePayload.LocationPin(
+        lat = payload.dbl("lat") ?: 0.0,
+        lng = payload.dbl("lng") ?: 0.0,
+        placeName = payload.str("placeName") ?: "Location",
+        address = payload.str("address"),
+        deepLinkUrl = payload.str("deepLinkUrl") ?: "",
+    )
+    "plan_card" -> MessagePayload.PlanCard(
+        planId = payload.str("planId") ?: "",
+        title = payload.str("title") ?: "Hangout plan",
+        venueName = payload.str("venueName"),
+        planStatus = payload.str("planStatus") ?: "",
+    )
+    "system" -> MessagePayload.SystemNote(
+        subtype = payload.str("subtype") ?: "",
+        text = payload.str("text") ?: "",
+    )
+    else -> MessagePayload.Unknown
+}
+
+/** A display-ready one-line string for any payload type. */
+fun MessagePayload.displayText(): String = when (this) {
+    is MessagePayload.Text -> text
+    is MessagePayload.Image -> "📷 Photo"
+    is MessagePayload.LocationPin -> "📍 $placeName"
+    is MessagePayload.PlanCard -> "📋 $title"
+    is MessagePayload.SystemNote -> text
+    MessagePayload.Unknown -> "Unsupported message"
+}
+
+/** Map a modern chat envelope into the UI [ChatMessage]. */
+fun MessageEnvelopeDto.toChatMessage(currentUserId: String): ChatMessage {
+    val parsed = toMessagePayload()
+    return ChatMessage(
+        from = if (senderId == currentUserId) "me" else senderId,
+        text = if (deletedAt != null) "Message deleted" else parsed.displayText(),
+        time = Dates.shortLabel(Dates.parseMillis(createdAt)),
+        id = id,
+        senderName = senderName,
+        pending = false,
+        seq = seq,
+        payload = parsed,
+    )
+}
 
 // ── Discovery place ─────────────────────────────────────────────────────────
 

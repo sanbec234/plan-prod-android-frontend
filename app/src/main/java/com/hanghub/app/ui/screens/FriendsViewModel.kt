@@ -102,7 +102,10 @@ class FriendsViewModel(
         requests = requests.filterNot { it.id == requestId }
         viewModelScope.launch {
             when (val result = friendsRepository.acceptFriendRequest(requestId)) {
-                is ApiResult.Success -> appState.refreshFriends()
+                is ApiResult.Success -> {
+                    appState.refreshFriends()
+                    appState.refreshChats()
+                }
                 is ApiResult.Failure -> {
                     fail(result.error)
                     loadRequests()
